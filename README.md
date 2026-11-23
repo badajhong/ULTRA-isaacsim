@@ -38,8 +38,17 @@
 
 ## ⚙️ Installation
 
-See [docs/install.md](docs/install.md): Python 3.8, `pip install -r requirements.txt`, IsaacGym Preview 4, and
-`mujoco` for sim2sim. Run every command below from the repository root.
+ULTRA runs on **Isaac Sim 5.1** through **Isaac Lab 2.3.2** (Python 3.11, PyTorch 2.7 + CUDA 12.8), with `mujoco`
+for sim2sim. One script creates the conda environment:
+
+```bash
+scripts/setup_isaacsim_env.sh      # conda env `ultra-isaacsim` (ACCEPT_EULA=1 accepts the NVIDIA Omniverse EULA)
+conda activate ultra-isaacsim
+```
+
+See [docs/install.md](docs/install.md) for the manual steps, the EULA, and the differences from the original Isaac Gym
+setup. Run every command below from the repository root. The first run converts the robot and object assets to USD
+(cached in `ultra/data/assets/usd/`).
 
 ## 📦 Data
 
@@ -160,7 +169,7 @@ The command writes `output/teacher_inference/rollout.pt` with observed/reference
 ### 🤖 Student
 
 ```bash
-scripts/play_student.sh <student.pth> 1 full_track      # IsaacGym playback (also: sparse_track, object_obs points)
+scripts/play_student.sh <student.pth> 1 full_track      # Isaac Sim playback (also: sparse_track, object_obs points)
 scripts/sim2sim_student.sh <student.pth> InterAct/OMOMO_retarget_aug full_track   # MuJoCo
 scripts/export_jit.sh <student.pth> student_jit.pt      # TorchScript export
 ```
@@ -169,7 +178,8 @@ scripts/export_jit.sh <student.pth> student_jit.pt      # TorchScript export
 
 ULTRA's own code is released under Apache-2.0 (top-level `LICENSE`); the InterMimic-derived simulation and learning
 stack is under MIT (`LICENSE-InterMimic`). `ultra/env/tasks/base_task.py` and `vec_task.py` are adapted from
-NVIDIA's IsaacGym examples and keep NVIDIA's header. Robot assets are from Unitree; motion data derives from OMOMO
+NVIDIA's IsaacGym examples and keep NVIDIA's header. The simulator backend (`ultra/env/sim/`) uses Isaac Sim and
+Isaac Lab, which are installed separately under their own licenses. Robot assets are from Unitree; motion data derives from OMOMO
 through InterAct.
 
 ## 📖 Citation

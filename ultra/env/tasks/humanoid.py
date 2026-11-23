@@ -29,12 +29,11 @@ import numpy as np
 import torch
 import os
 
-from isaacgym import gymtorch
-from isaacgym import gymapi
-from isaacgym.torch_utils import *
+from utils.sim_torch_utils import *
 
 from utils import torch_utils
 from env.tasks.base_task import BaseTask
+from env.sim.backend import IsaacSimBackend, PlaneSpec, RobotSpec
 
 
 
@@ -83,25 +82,14 @@ class Humanoid_SMPLX(BaseTask):
             device=self.device,
             requires_grad=False,
         ) + str_rng[0]
-        # get gym GPU state tensors
-        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
-        dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
-        rigid_body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
-        contact_force_tensor = self.gym.acquire_net_contact_force_tensor(self.sim)
+        # simulator state tensors (Isaac Gym layout, see env.sim.backend)
+        self.dof_force_tensor = self.sim.dof_force_tensor.view(self.num_envs, self.num_dof)
+        self.sim.refresh_all()
 
-
-        dof_force_tensor = self.gym.acquire_dof_force_tensor(self.sim)
-        self.dof_force_tensor = gymtorch.wrap_tensor(dof_force_tensor).view(self.num_envs, self.num_dof)
-        
-        self.gym.refresh_dof_state_tensor(self.sim)
-        self.gym.refresh_actor_root_state_tensor(self.sim)
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-        self.gym.refresh_net_contact_force_tensor(self.sim)
-
-        self._root_states = gymtorch.wrap_tensor(actor_root_state)
+        self._root_states = self.sim.root_state_tensor
         num_actors = self.get_num_actors_per_env()
         
-        self._humanoid_root_states = self._root_states.view(self.num_envs, num_actors, actor_root_state.shape[-1])[..., 0, :]
+        self._humanoid_root_states = self._root_states.view(self.num_envs, num_actors, self._root_states.shape[-1])[..., 0, :]
         self._initial_humanoid_root_states = self._humanoid_root_states.clone()
         self._initial_humanoid_root_states[:] = 0
         self._initial_humanoid_root_states[:, 6:7] = 1
@@ -109,7 +97,7 @@ class Humanoid_SMPLX(BaseTask):
         self._humanoid_actor_ids = num_actors * torch.arange(self.num_envs, device=self.device, dtype=torch.int32)
 
         # create some wrapper tensors for different slices
-        self._dof_state = gymtorch.wrap_tensor(dof_state_tensor)
+        self._dof_state = self.sim.dof_state_tensor
         dofs_per_env = self._dof_state.shape[0] // self.num_envs
         self._dof_pos = self._dof_state.view(self.num_envs, dofs_per_env, 2)[..., :self.num_dof, 0]
         self._dof_vel = self._dof_state.view(self.num_envs, dofs_per_env, 2)[..., :self.num_dof, 1]
@@ -117,7 +105,7 @@ class Humanoid_SMPLX(BaseTask):
         self._initial_dof_pos = torch.zeros_like(self._dof_pos, device=self.device, dtype=torch.float)
         self._initial_dof_vel = torch.zeros_like(self._dof_vel, device=self.device, dtype=torch.float)
         
-        self._rigid_body_state = gymtorch.wrap_tensor(rigid_body_state)
+        self._rigid_body_state = self.sim.rigid_body_state_tensor
         bodies_per_env = self._rigid_body_state.shape[0] // self.num_envs
         rigid_body_state_reshaped = self._rigid_body_state.view(self.num_envs, bodies_per_env, 13)
 
@@ -126,7 +114,7 @@ class Humanoid_SMPLX(BaseTask):
         self._rigid_body_vel = rigid_body_state_reshaped[..., :self.num_bodies, 7:10]
         self._rigid_body_ang_vel = rigid_body_state_reshaped[..., :self.num_bodies, 10:13]
 
-        contact_force_tensor = gymtorch.wrap_tensor(contact_force_tensor)
+        contact_force_tensor = self.sim.net_contact_force_tensor
         self._contact_forces = contact_force_tensor.view(self.num_envs, bodies_per_env, 3)[..., :self.num_bodies, :]
         
         self._terminate_buf = torch.ones(self.num_envs, device=self.device, dtype=torch.long)
@@ -162,11 +150,22 @@ class Humanoid_SMPLX(BaseTask):
 
     def create_sim(self):
         self.up_axis_idx = self.set_sim_params_up_axis(self.sim_params, 'z')
-        self.sim = super().create_sim(self.device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
-
-        self._create_ground_plane()
+        # the ground plane is created by the simulation backend (see _create_backend)
         self._create_envs(self.num_envs, self.cfg["env"]['envSpacing'], int(np.sqrt(self.num_envs)))
         return
+
+    def _create_backend(self, robot_spec, num_envs, spacing):
+        """Create the Isaac Sim scene: ground plane, one robot per env and, if the task defines object
+        assets (``self._object_specs``), one object per env (env ``i`` gets object type ``i % num_types``)."""
+        plane = PlaneSpec(static_friction=self.plane_static_friction,
+                          dynamic_friction=self.plane_dynamic_friction,
+                          restitution=self.plane_restitution)
+        self.sim = IsaacSimBackend(self.sim_params, self.device, self.headless, num_envs, spacing, robot_spec,
+                                   objects=getattr(self, "_object_specs", None), plane=plane,
+                                   object_scale=getattr(self, "ball_size", 1.0))
+        self.envs = list(range(num_envs))  # environment "handles" are environment indices
+        self.humanoid_handles = [0] * num_envs
+        return self.sim
 
     def reset(self, env_ids=None):
         if (env_ids is None):
@@ -175,14 +174,7 @@ class Humanoid_SMPLX(BaseTask):
         return
 
     def set_char_color(self, col, env_ids):
-        for env_id in env_ids:
-            env_ptr = self.envs[env_id]
-            handle = self.humanoid_handles[env_id]
-
-            for j in range(self.num_bodies):
-                self.gym.set_rigid_body_color(env_ptr, handle, j, gymapi.MESH_VISUAL,
-                                              gymapi.Vec3(col[0], col[1], col[2]))
-
+        # Per-link recolouring of the robot is not supported by the Isaac Sim backend (visual only).
         return
 
     def _reset_envs(self, env_ids):
@@ -195,23 +187,10 @@ class Humanoid_SMPLX(BaseTask):
 
     def _reset_env_tensors(self, env_ids):
         env_ids_int32 = self._humanoid_actor_ids[env_ids]
-        self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self._root_states),
-                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
-        self.gym.set_dof_state_tensor_indexed(self.sim,
-                                              gymtorch.unwrap_tensor(self._dof_state),
-                                              gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+        self.sim.set_actor_root_state_tensor_indexed(self._root_states, env_ids_int32)
+        self.sim.set_dof_state_tensor_indexed(self._dof_state, env_ids_int32)
         self.reset_buf[env_ids] = 0
         self._terminate_buf[env_ids] = 0
-        return
-
-    def _create_ground_plane(self):
-        plane_params = gymapi.PlaneParams()
-        plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
-        plane_params.static_friction = self.plane_static_friction
-        plane_params.dynamic_friction = self.plane_dynamic_friction
-        plane_params.restitution = self.plane_restitution
-        self.gym.add_ground(self.sim, plane_params)
         return
 
     def _setup_character_props(self, key_bodies):
@@ -230,71 +209,44 @@ class Humanoid_SMPLX(BaseTask):
         return self.ref_hoi_obs_size
     
     def _create_envs(self, num_envs, spacing, num_per_row):
-        lower = gymapi.Vec3(-spacing, -spacing, 0.0)
-        upper = gymapi.Vec3(spacing, spacing, spacing)
-
         asset_root = self.cfg["env"]["asset"]["assetRoot"]
         asset_file = self.robot_type
-
         asset_path = os.path.join(asset_root, asset_file)
-        asset_root = os.path.dirname(asset_path)
-        asset_file = os.path.basename(asset_path)
+        if not asset_path.endswith(".urdf"):
+            raise NotImplementedError(f"the Isaac Sim backend loads URDF robots only, got {asset_path}")
 
-        asset_options = gymapi.AssetOptions()
-        asset_options.angular_damping = 0.01
-        asset_options.max_angular_velocity = 100.0
-        asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-        humanoid_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+        # Isaac Gym asset options of the SMPL-X humanoid: angular_damping=0.01, max_angular_velocity=100,
+        # collision filter 1 on every shape (no self collisions), PD drives when pdControl is set.
+        robot = RobotSpec(urdf_path=asset_path, init_height=0.89, position_control=self._pd_control,
+                          angular_damping=0.01, max_angular_velocity=100.0, self_collisions=False)
+        self._create_backend(robot, num_envs, spacing)
 
-        self.num_humanoid_bodies = self.gym.get_asset_rigid_body_count(humanoid_asset)
-        self.num_humanoid_shapes = self.gym.get_asset_rigid_shape_count(humanoid_asset)
-
-        actuator_props = self.gym.get_asset_actuator_properties(humanoid_asset)
-        motor_efforts = [prop.motor_effort for prop in actuator_props]
-        
-        # create force sensors at the feet
-        right_foot_idx = self.gym.find_asset_rigid_body_index(humanoid_asset, "right_foot")
-        left_foot_idx = self.gym.find_asset_rigid_body_index(humanoid_asset, "left_foot")
-        
-        sensor_pose = gymapi.Transform()
-
-        self.gym.create_asset_force_sensor(humanoid_asset, right_foot_idx, sensor_pose)
-        self.gym.create_asset_force_sensor(humanoid_asset, left_foot_idx, sensor_pose)
-
+        self.num_humanoid_bodies = self.sim.num_bodies
+        motor_efforts = list(self.sim.urdf_info.dof_effort)
         self.max_motor_effort = max(motor_efforts)
         self.motor_efforts = to_torch(motor_efforts, device=self.device)
 
         self.torso_index = 0
-        self.num_bodies = self.gym.get_asset_rigid_body_count(humanoid_asset)
-        self.num_dof = self.gym.get_asset_dof_count(humanoid_asset)
-        self.num_joints = self.gym.get_asset_joint_count(humanoid_asset)
+        self.num_bodies = self.sim.num_bodies
+        self.num_dof = self.sim.num_dofs
+        self.num_joints = self.sim.num_bodies - 1
 
-        self.humanoid_handles = []
-        self.envs = []
+        self._init_env_property_buffers()
+        for i in range(self.num_envs):
+            self._build_env(i, self.envs[i], None)
+        self._apply_env_properties()
+
         self.dof_limits_lower = []
         self.dof_limits_upper = []
-
-        max_agg_bodies = self.num_humanoid_bodies + 2
-        max_agg_shapes = self.num_humanoid_shapes + 65        
-        
-        for i in range(self.num_envs):
-            # create env instance
-            env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
-            self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
-
-            self._build_env(i, env_ptr, humanoid_asset)
-
-            self.gym.end_aggregate(env_ptr)
-            self.envs.append(env_ptr)
-
-        dof_prop = self.gym.get_actor_dof_properties(self.envs[0], self.humanoid_handles[0])
+        lower = self.sim.dof_limits_lower.cpu().numpy()
+        upper = self.sim.dof_limits_upper.cpu().numpy()
         for j in range(self.num_dof):
-            if dof_prop['lower'][j] > dof_prop['upper'][j]:
-                self.dof_limits_lower.append(dof_prop['upper'][j])
-                self.dof_limits_upper.append(dof_prop['lower'][j])
+            if lower[j] > upper[j]:
+                self.dof_limits_lower.append(upper[j])
+                self.dof_limits_upper.append(lower[j])
             else:
-                self.dof_limits_lower.append(dof_prop['lower'][j])
-                self.dof_limits_upper.append(dof_prop['upper'][j])
+                self.dof_limits_lower.append(lower[j])
+                self.dof_limits_upper.append(upper[j])
 
         self.dof_limits_lower = to_torch(self.dof_limits_lower, device=self.device)
         self.dof_limits_upper = to_torch(self.dof_limits_upper, device=self.device)
@@ -305,31 +257,51 @@ class Humanoid_SMPLX(BaseTask):
         return
     
     def _build_env(self, env_id, env_ptr, humanoid_asset):
-        col_group = env_id
-        col_filter = self._get_humanoid_collision_filter()
-        segmentation_id = 0
+        # Per-environment setup hook, called once per environment after the scene has been created.
+        # Subclasses fill the ``_env_*`` property buffers; ``_apply_env_properties`` writes them to the simulator.
+        return
 
-        start_pose = gymapi.Transform()
-        asset_file = self.robot_type
-        char_h = 0.89
+    def _init_env_property_buffers(self):
+        """Per-environment physical properties (CPU tensors, Isaac Gym body order), initialised from the sim.
 
-        start_pose.p = gymapi.Vec3(*get_axis_params(char_h, self.up_axis_idx))
-        start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+        Isaac Gym set these while creating each actor; with Isaac Sim the scene is created first and the values
+        are written in bulk by ``_apply_env_properties``.
+        """
+        self._env_robot_friction = None  # None: keep the default friction (1.0) of the robot shapes
+        self._env_robot_masses_default = self.sim.get_robot_masses()
+        self._env_robot_masses = self._env_robot_masses_default.clone()
+        self._env_robot_coms_default = self.sim.get_robot_coms()
+        self._env_robot_coms = self._env_robot_coms_default.clone()
+        self._env_robot_inertias = self.sim.get_robot_inertias()
+        if self.sim.has_object:
+            self._env_object_friction = torch.ones(self.num_envs)
+            self._env_object_restitution = torch.zeros(self.num_envs)
+            self._env_object_masses_default = self.sim.get_object_masses()
+            self._env_object_masses = self._env_object_masses_default.clone()
+            self._env_object_coms_default = self.sim.get_object_coms()
+            self._env_object_coms = self._env_object_coms_default.clone()
+            self._env_object_inertias_default = self.sim.get_object_inertias()
+            self._env_object_inertias = self._env_object_inertias_default.clone()
+        return
 
-        humanoid_handle = self.gym.create_actor(env_ptr, humanoid_asset, start_pose, "humanoid", col_group, col_filter, segmentation_id)
-
-        self.gym.enable_actor_dof_force_sensors(env_ptr, humanoid_handle)
-
-        for j in range(self.num_bodies):
-            self.gym.set_rigid_body_color(env_ptr, humanoid_handle, j, gymapi.MESH_VISUAL, gymapi.Vec3(0.75, 0.54, 0.3))
-
-        if (self._pd_control):
-            dof_prop = self.gym.get_asset_dof_properties(humanoid_asset)
-            dof_prop["driveMode"] = gymapi.DOF_MODE_POS
-            self.gym.set_actor_dof_properties(env_ptr, humanoid_handle, dof_prop)
-
-        self.humanoid_handles.append(humanoid_handle)
-
+    def _apply_env_properties(self):
+        if self._env_robot_friction is not None:
+            self.sim.set_robot_friction(self._env_robot_friction)
+        if not torch.equal(self._env_robot_masses, self._env_robot_masses_default):
+            # Isaac Gym's recomputeInertia=True scales each body's inertia by new_mass / old_mass
+            ratio = self._env_robot_masses / self._env_robot_masses_default.clamp(min=1e-12)
+            self.sim.set_robot_masses(self._env_robot_masses)
+            self.sim.set_robot_inertias(self._env_robot_inertias * ratio.unsqueeze(-1))
+        if not torch.equal(self._env_robot_coms, self._env_robot_coms_default):
+            self.sim.set_robot_coms(self._env_robot_coms)
+        if self.sim.has_object:
+            self.sim.set_object_material(self._env_object_friction, self._env_object_restitution)
+            if not torch.equal(self._env_object_masses, self._env_object_masses_default):
+                self.sim.set_object_masses(self._env_object_masses)
+            if not torch.equal(self._env_object_inertias, self._env_object_inertias_default):
+                self.sim.set_object_inertias(self._env_object_inertias)
+            if not torch.equal(self._env_object_coms, self._env_object_coms_default):
+                self.sim.set_object_coms(self._env_object_coms)
         return
 
     def _build_pd_action_offset_scale(self):
@@ -359,14 +331,12 @@ class Humanoid_SMPLX(BaseTask):
         return
 
     def _refresh_sim_tensors(self):
-        self.gym.fetch_results(self.sim, True)
-        self.gym.refresh_dof_state_tensor(self.sim)
-        self.gym.refresh_actor_root_state_tensor(self.sim)
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.sim.refresh_dof_state_tensor()
+        self.sim.refresh_actor_root_state_tensor()
+        self.sim.refresh_rigid_body_state_tensor()
 
-        self.gym.refresh_force_sensor_tensor(self.sim)
-        self.gym.refresh_dof_force_tensor(self.sim)
-        self.gym.refresh_net_contact_force_tensor(self.sim)
+        self.sim.refresh_dof_force_tensor()
+        self.sim.refresh_net_contact_force_tensor()
         return
 
 
@@ -538,12 +508,10 @@ class Humanoid_SMPLX(BaseTask):
         # self.actions = 0.1 * actions.to(self.device).clone() + 0.9 * last_actions if last_actions is not None else actions.to(self.device).clone()
         # if (self._pd_control):
         #     pd_tar = self._action_to_pd_targets(self.actions)
-        #     pd_tar_tensor = gymtorch.unwrap_tensor(pd_tar)
-        #     self.gym.set_dof_position_target_tensor(self.sim, pd_tar_tensor)
+        #     self.sim.set_dof_position_target_tensor(pd_tar)
         # else:
         #     forces = self.actions * self.motor_efforts.unsqueeze(0) * self.power_scale
-        #     force_tensor = gymtorch.unwrap_tensor(forces)
-        #     self.gym.set_dof_actuation_force_tensor(self.sim, force_tensor)       
+        #     self.sim.set_dof_actuation_force_tensor(forces)
 
         return
     
@@ -563,14 +531,14 @@ class Humanoid_SMPLX(BaseTask):
             self.ang_vel_list = []
         position_control = self.cfg["env"].get("retargetPositionControl", False)
         if position_control:
-            pd_tar_tensor = gymtorch.unwrap_tensor(self._action_to_pd_targets(self.actions))
+            pd_tar = self._action_to_pd_targets(self.actions)
         for i in range(self.control_freq_inv):
             if position_control:
-                self.gym.set_dof_position_target_tensor(self.sim, pd_tar_tensor)
+                self.sim.set_dof_position_target_tensor(pd_tar)
             else:
                 self.torques = self._compute_torques(self.actions)
-                self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
-            self.gym.simulate(self.sim)
+                self.sim.set_dof_actuation_force_tensor(self.torques)
+            self.sim.simulate()
             self._refresh_sim_tensors()
             if position_control:
                 self.torques = self.dof_force_tensor.clone()
@@ -602,7 +570,7 @@ class Humanoid_SMPLX(BaseTask):
             )  # obj ang vel xyz
         # self.root_states[:, 7:9] = -3.5 + 0*torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=self.device) # lin vel x/y
         # self.root_states[:, 8] = 0
-        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self._root_states))
+        self.sim.set_actor_root_state_tensor(self._root_states)
 
         # Reset the steps_since_push counter for all environments
         if hasattr(self, 'steps_since_push'):
@@ -617,14 +585,12 @@ class Humanoid_SMPLX(BaseTask):
                 + min_gravity
             )
 
-        sim_params = self.gym.get_sim_params(self.sim)
         if external_force is None:
             gravity = torch.Tensor([0, 0, -9.81]).to(self.device)
         else:
             gravity = external_force + torch.Tensor([0, 0, -9.81]).to(self.device)
         self.gravity_vec[:, :] = gravity.unsqueeze(0) / torch.norm(gravity)
-        sim_params.gravity = gymapi.Vec3(gravity[0], gravity[1], gravity[2])
-        self.gym.set_sim_params(self.sim, sim_params)
+        self.sim.set_gravity(gravity.tolist())
 
     def post_physics_step(self):
         self.progress_buf += 1
@@ -681,12 +647,10 @@ class Humanoid_SMPLX(BaseTask):
         return
 
     def _build_key_body_ids_tensor(self, key_body_names):
-        env_ptr = self.envs[0]
-        actor_handle = self.humanoid_handles[0]
         body_ids = []
 
         for body_name in key_body_names:
-            body_id = self.gym.find_actor_rigid_body_handle(env_ptr, actor_handle, body_name)
+            body_id = self.sim.find_body_index(body_name)
             assert(body_id != -1)
             body_ids.append(body_id)
 
@@ -694,12 +658,10 @@ class Humanoid_SMPLX(BaseTask):
         return body_ids
 
     def _build_contact_body_ids_tensor(self, contact_body_names):
-        env_ptr = self.envs[0]
-        actor_handle = self.humanoid_handles[0]
         body_ids = []
 
         for body_name in contact_body_names:
-            body_id = self.gym.find_actor_rigid_body_handle(env_ptr, actor_handle, body_name)
+            body_id = self.sim.find_body_index(body_name)
             assert(body_id != -1)
             body_ids.append(body_id)
 
@@ -711,16 +673,12 @@ class Humanoid_SMPLX(BaseTask):
         return pd_tar
 
     def _init_camera(self):
-        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.sim.refresh_actor_root_state_tensor()
         self._cam_prev_char_pos = self._humanoid_root_states[0, 0:3].cpu().numpy()
         
-        cam_pos = gymapi.Vec3(self._cam_prev_char_pos[0], 
-                              self._cam_prev_char_pos[1] - 3.0, 
-                              1.0)
-        cam_target = gymapi.Vec3(self._cam_prev_char_pos[0],
-                                 self._cam_prev_char_pos[1],
-                                 1.0)
-        self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
+        cam_pos = [self._cam_prev_char_pos[0], self._cam_prev_char_pos[1] - 3.0, 1.0]
+        cam_target = [self._cam_prev_char_pos[0], self._cam_prev_char_pos[1], 1.0]
+        self.viewer.look_at(cam_pos, cam_target, env_id=0)
         return
 
     def _update_camera(self):
@@ -728,7 +686,7 @@ class Humanoid_SMPLX(BaseTask):
     
 
     def _update_debug_viz(self):
-        self.gym.clear_lines(self.viewer)
+        self.viewer.clear_lines()
         return
 
 def _rand_vec(vec, scale=0.1):

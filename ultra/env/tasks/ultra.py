@@ -3,13 +3,12 @@ import numpy as np
 import torch
 import os
 
-from isaacgym import gymtorch
-from isaacgym import gymapi
-from isaacgym.torch_utils import *
+from utils.sim_torch_utils import *
 
 from utils import torch_utils
 import torch.nn.functional as F
 from env.tasks.humanoid import *
+from env.sim.backend import ObjectSpec
 import trimesh
 import random
 
@@ -245,7 +244,7 @@ class Ultra(Humanoid_SMPLX):
 
     def _load_target_asset(self): # smplx
         asset_root = "ultra/data/assets/objects/diverse/"
-        self._target_asset = []
+        self._object_specs = []  # one object type per entry; env i uses type i % len(self.object_name)
         points_num = []
         self.object_points = []
         self.object_corners = []
@@ -263,17 +262,17 @@ class Ultra(Humanoid_SMPLX):
             else:
                 max_convex_hulls = random.randint(1, 10)
             density = self.object_density
-        
-            asset_options = gymapi.AssetOptions()
-            asset_options.density = density
-            asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-            asset_options.vhacd_enabled = True
-            asset_options.vhacd_params.max_convex_hulls = max_convex_hulls
-            asset_options.vhacd_params.max_num_vertices_per_ch = 64
-            asset_options.vhacd_params.resolution = 300000
 
-
-            self._target_asset.append(self.gym.load_asset(self.sim, new_asset_root, asset_file, asset_options))
+            # The object URDFs hold a single link whose collision mesh is ``obj_file``; Isaac Gym built it with
+            # these density / V-HACD options.
+            self._object_specs.append(ObjectSpec(
+                name=object_name,
+                mesh_path=obj_file,
+                density=density,
+                max_convex_hulls=max_convex_hulls,
+                hull_vertex_limit=64,
+                voxel_resolution=300000,
+            ))
 
             mesh_obj = trimesh.load(obj_file, process=False, force='mesh')
             obb = mesh_obj.bounding_box_oriented
@@ -300,24 +299,13 @@ class Ultra(Humanoid_SMPLX):
         return
 
     def _build_target(self, env_id, env_ptr):
-        col_group = env_id
-        col_filter = 0
-        segmentation_id = 0
+        # The object of env ``env_id`` (type env_id % len(self.object_name)) is actor 1 of the environment and
+        # was spawned with scale ``self.ball_size``. Isaac Gym shape properties: restitution 0.6, friction 0.5
+        # (rolling_friction 0.01 / torsion_friction 0.5 have no PhysX 5 material equivalent).
+        self._env_object_restitution[env_id] = 0.6
+        self._env_object_friction[env_id] = 0.5
 
-        default_pose = gymapi.Transform()
-        
-        target_handle = self.gym.create_actor(env_ptr, self._target_asset[env_id % len(self.object_name)], default_pose, self.object_name[env_id % len(self.object_name)], col_group, col_filter, segmentation_id)
-
-        props = self.gym.get_actor_rigid_shape_properties(env_ptr, target_handle)
-        for p_idx in range(len(props)):
-            props[p_idx].restitution = 0.6
-            props[p_idx].friction = 0.5
-            props[p_idx].rolling_friction = 0.01
-            props[p_idx].torsion_friction = 0.5
-        self.gym.set_actor_rigid_shape_properties(env_ptr, target_handle, props)
-
-        self._target_handles.append(target_handle)
-        self.gym.set_actor_scale(env_ptr, target_handle, self.ball_size)
+        self._target_handles.append(1)
 
         return
 
@@ -329,8 +317,7 @@ class Ultra(Humanoid_SMPLX):
         self._tar_actor_ids = to_torch(num_actors * np.arange(self.num_envs), device=self.device, dtype=torch.int32) + 1
         
         bodies_per_env = self._rigid_body_state.shape[0] // self.num_envs
-        contact_force_tensor = self.gym.acquire_net_contact_force_tensor(self.sim)
-        contact_force_tensor = gymtorch.wrap_tensor(contact_force_tensor)
+        contact_force_tensor = self.sim.net_contact_force_tensor
         self._tar_contact_forces = contact_force_tensor.view(self.num_envs, bodies_per_env, 3)[..., self.num_bodies, :]
         return
     
@@ -348,8 +335,7 @@ class Ultra(Humanoid_SMPLX):
 
 
         env_ids_int32 = self._tar_actor_ids[env_ids]
-        self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self._root_states),
-                                                    gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+        self.sim.set_actor_root_state_tensor_indexed(self._root_states, env_ids_int32)
     
         return
 
@@ -531,16 +517,11 @@ class Ultra(Humanoid_SMPLX):
 
 
         env_ids_int32 = self._humanoid_actor_ids[env_ids]
-        self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self._root_states),
-                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
-        self.gym.set_dof_state_tensor_indexed(self.sim,
-                                              gymtorch.unwrap_tensor(self._dof_state),
-                                              gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+        self.sim.set_actor_root_state_tensor_indexed(self._root_states, env_ids_int32)
+        self.sim.set_dof_state_tensor_indexed(self._dof_state, env_ids_int32)
         
         env_ids_int32 = self._tar_actor_ids[env_ids]
-        self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self._root_states),
-                                                    gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+        self.sim.set_actor_root_state_tensor_indexed(self._root_states, env_ids_int32)
 
         self._refresh_sim_tensors()
         # ### draw contact label ###
@@ -548,18 +529,14 @@ class Ultra(Humanoid_SMPLX):
             if env_id in env_ids:
                 contact = self.hoi_data_dict[self.data_id[env_id]]['contact'][t,:]
                 obj_contact = torch.any(contact > 0.1, dim=-1)
-                env_ptr = self.envs[env_id]
-                handle = self._target_handles[env_id]
 
                 if obj_contact == True:
-                    self.gym.set_rigid_body_color(env_ptr, handle, 0, gymapi.MESH_VISUAL,
-                                                gymapi.Vec3(1., 0., 0.))
+                    self.sim.set_object_color(env_id, (1., 0., 0.))
                 else:
-                    self.gym.set_rigid_body_color(env_ptr, handle, 0, gymapi.MESH_VISUAL,
-                                                gymapi.Vec3(0., 0., 1.))
+                    self.sim.set_object_color(env_id, (0., 0., 1.))
                 
         self.render(t=t)
-        self.gym.simulate(self.sim)
+        self.sim.simulate()
 
         return
     
@@ -579,7 +556,7 @@ class Ultra(Humanoid_SMPLX):
                 dataname = self.motion_file[-1][6:-3]
                 rgb_filename = "ultra/data/images/" + dataname + "/rgb_env%d_frame%05d.png" % (env_ids, frame_id)
                 os.makedirs("ultra/data/images/" + dataname, exist_ok=True)
-                self.gym.write_viewer_image_to_file(self.viewer,rgb_filename)
+                self.viewer.write_image(rgb_filename)
         return
 
 

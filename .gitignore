@@ -24,8 +24,9 @@ events.out.tfevents*
 InterAct/
 OMOMO*/
 
-# generated at runtime (merge_mjcf scenes, --save_images frames / videos)
+# generated at runtime (merge_mjcf scenes, Isaac Sim USD cache, --save_images frames / videos)
 ultra/data/assets/merge/
+ultra/data/assets/usd/
 ultra/data/images/
 ultra/data/videos/
 

@@ -1,11 +1,62 @@
 import torch
 import os
 
-from isaacgym import gymapi
-from isaacgym.torch_utils import *
+from utils.sim_torch_utils import *
 import torch.nn.functional as F
 from utils import torch_utils
 from env.tasks.humanoid import *
+from env.sim.backend import RobotSpec
+from env.sim.urdf_info import parse_urdf
+
+# Per-DOF actuation of the released G1 policies (Isaac Gym DOF order).
+# Kp (stiffness) per DOF
+G1_STIFFNESS = [40.179238, 99.098428, 40.179238, 99.098428, 28.501246, 28.501246,
+                40.179238, 99.098428, 40.179238, 99.098428, 28.501246, 28.501246,
+                40.179238, 28.501246, 28.501246,
+                14.250623, 14.250623, 14.250623, 14.250623, 14.250623, 16.778327, 16.778327,
+                14.250623, 14.250623, 14.250623, 14.250623, 14.250623, 16.778327, 16.778327]
+
+# Kd (damping) per DOF
+G1_DAMPING = [2.557890, 6.308802, 2.557890, 6.308802, 1.814446, 1.814446,
+              2.557890, 6.308802, 2.557890, 6.308802, 1.814446, 1.814446,
+              2.557890, 1.814446, 1.814446,
+              0.907223, 0.907223, 0.907223, 0.907223, 0.907223, 1.068142, 1.068142,
+              0.907223, 0.907223, 0.907223, 0.907223, 0.907223, 1.068142, 1.068142]
+
+# armature per DOF (NOTE: feet + waist roll/pitch are doubled vs ARMATURE_5020)
+G1_ARMATURE = [0.010178, 0.025102, 0.010178, 0.025102, 0.007219, 0.007219,
+               0.010178, 0.025102, 0.010178, 0.025102, 0.007219, 0.007219,
+               0.010178, 0.007219, 0.007219,
+               0.003610, 0.003610, 0.003610, 0.003610, 0.003610, 0.004250, 0.004250,
+               0.003610, 0.003610, 0.003610, 0.003610, 0.003610, 0.004250, 0.004250]
+
+# effort limits per DOF (used for the joint effort limits and for torque_limits)
+G1_EFFORT = [88.0, 139.0, 88.0, 139.0, 50.0, 50.0,
+             88.0, 139.0, 88.0, 139.0, 50.0, 50.0,
+             88.0, 50.0, 50.0,
+             25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0,
+             25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0]
+
+
+def g1_collision_filter(body_names):
+    """Isaac Gym shape filter bits of the leg links (shapes do not collide when ``bits_a & bits_b != 0``)."""
+    bits = {}
+    for name in body_names:
+        if 'right' in name:
+            if 'ankle' in name:
+                bits[name] = 2
+            elif 'knee' in name:
+                bits[name] = 6
+            elif 'hip' in name:
+                bits[name] = 12
+        if 'left' in name:
+            if 'ankle' in name:
+                bits[name] = 16
+            elif 'knee' in name:
+                bits[name] = 48
+            elif 'hip' in name:
+                bits[name] = 96
+    return bits
 
 
 class Humanoid_G1(Humanoid_SMPLX):
@@ -48,42 +99,44 @@ class Humanoid_G1(Humanoid_SMPLX):
         return
     
     def _create_envs(self, num_envs, spacing, num_per_row):
-        lower = gymapi.Vec3(-spacing, -spacing, 0.0)
-        upper = gymapi.Vec3(spacing, spacing, spacing)
-
         asset_root = self.cfg["env"]["asset"]["assetRoot"]
         asset_file = self.robot_type
-
         asset_path = os.path.join(asset_root, asset_file)
-        asset_root = os.path.dirname(asset_path)
-        asset_file = os.path.basename(asset_path)
 
-        asset_options = gymapi.AssetOptions()
-        asset_options.vhacd_enabled = True
-        asset_options.vhacd_params.max_convex_hulls = 5
-        asset_options.vhacd_params.max_num_vertices_per_ch = 16
-        asset_options.vhacd_params.resolution = 60000
-        asset_options.default_dof_drive_mode = (gymapi.DOF_MODE_POS if self.cfg["env"].get("retargetPositionControl", False) else gymapi.DOF_MODE_EFFORT)
+        position_control = self.cfg["env"].get("retargetPositionControl", False)
+        robot = RobotSpec(
+            urdf_path=asset_path,
+            init_height=0.89,
+            position_control=position_control,
+            stiffness=G1_STIFFNESS if (self._pd_control and position_control) else None,
+            damping=G1_DAMPING if (self._pd_control and position_control) else None,
+            effort_limit=G1_EFFORT if self._pd_control else None,
+            armature=G1_ARMATURE if self._pd_control else None,
+            self_collisions=True,
+            collision_filter=g1_collision_filter(parse_urdf(asset_path).body_names),
+            # Isaac Gym V-HACD options of the G1 asset
+            max_convex_hulls=5,
+            hull_vertex_limit=16,
+            voxel_resolution=60000,
+        )
+        self._create_backend(robot, num_envs, spacing)
 
-        humanoid_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
-        right_foot_idx = self.gym.find_asset_rigid_body_index(humanoid_asset, "right_ankle_roll_link")
-        left_foot_idx = self.gym.find_asset_rigid_body_index(humanoid_asset, "left_ankle_roll_link")
+        right_foot_idx = self.sim.find_body_index("right_ankle_roll_link")
+        left_foot_idx = self.sim.find_body_index("left_ankle_roll_link")
         
         self.feet_indices = torch.zeros(
             2, dtype=torch.long, device=self.device, requires_grad=False
         )
         penalized_contact_names = []
         penalize_contacts_on = ["shoulder", "elbow", "hip"]
-        body_names = self.gym.get_asset_rigid_body_names(humanoid_asset)
+        body_names = self.sim.body_names
         for name in penalize_contacts_on:
             penalized_contact_names.extend([s for s in body_names if name in s])
         self.penalized_contact_indices = torch.zeros(
             len(penalized_contact_names), dtype=torch.long, device=self.device, requires_grad=False
         )
         for i in range(len(penalized_contact_names)):
-            self.penalized_contact_indices[i] = self.gym.find_asset_rigid_body_index(
-                humanoid_asset, penalized_contact_names[i]
-            )
+            self.penalized_contact_indices[i] = self.sim.find_body_index(penalized_contact_names[i])
         self.feet_indices[0] = left_foot_idx
         self.feet_indices[1] = right_foot_idx
         knee_names = [s for s in body_names if 'knee' in s]
@@ -91,44 +144,31 @@ class Humanoid_G1(Humanoid_SMPLX):
             len(knee_names), dtype=torch.long, device=self.device, requires_grad=False
         )
         for i in range(len(knee_names)):
-            self.knee_indices[i] = self.gym.find_asset_rigid_body_index(
-                humanoid_asset, knee_names[i]
-            )
-        self.num_humanoid_bodies = self.gym.get_asset_rigid_body_count(humanoid_asset)
-        self.num_humanoid_shapes = self.gym.get_asset_rigid_shape_count(humanoid_asset)
+            self.knee_indices[i] = self.sim.find_body_index(knee_names[i])
+        self.num_humanoid_bodies = self.sim.num_bodies
 
-        self.torso_idx = self.gym.find_asset_rigid_body_index(humanoid_asset, "torso_link")
+        self.torso_idx = self.sim.find_body_index("torso_link")
         
-        self.num_bodies = self.gym.get_asset_rigid_body_count(humanoid_asset)
-        self.num_dof = self.gym.get_asset_dof_count(humanoid_asset)
-        self.num_joints = self.gym.get_asset_joint_count(humanoid_asset)
+        self.num_bodies = self.sim.num_bodies
+        self.num_dof = self.sim.num_dofs
+        self.num_joints = self.sim.num_bodies - 1
 
-        self.humanoid_handles = []
-        self.envs = []
+        self._init_env_property_buffers()
+        for i in range(self.num_envs):
+            self._build_env(i, self.envs[i], None)
+        self._apply_env_properties()
+
         self.dof_limits_lower = []
         self.dof_limits_upper = []
-
-        max_agg_bodies = self.num_humanoid_bodies + 2
-        max_agg_shapes = self.num_humanoid_shapes + 65
-        
-        for i in range(self.num_envs):
-            # create env instance
-            env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
-            self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
-
-            self._build_env(i, env_ptr, humanoid_asset)
-
-            self.gym.end_aggregate(env_ptr)
-            self.envs.append(env_ptr)
-
-        dof_prop = self.gym.get_actor_dof_properties(self.envs[0], self.humanoid_handles[0])
+        lower = self.sim.dof_limits_lower.cpu().numpy()
+        upper = self.sim.dof_limits_upper.cpu().numpy()
         for j in range(self.num_dof):
-            if dof_prop['lower'][j] > dof_prop['upper'][j]:
-                self.dof_limits_lower.append(dof_prop['upper'][j])
-                self.dof_limits_upper.append(dof_prop['lower'][j])
+            if lower[j] > upper[j]:
+                self.dof_limits_lower.append(upper[j])
+                self.dof_limits_upper.append(lower[j])
             else:
-                self.dof_limits_lower.append(dof_prop['lower'][j])
-                self.dof_limits_upper.append(dof_prop['upper'][j])
+                self.dof_limits_lower.append(lower[j])
+                self.dof_limits_upper.append(upper[j])
 
         self.dof_limits_lower = to_torch(self.dof_limits_lower, device=self.device)
         self.dof_limits_upper = to_torch(self.dof_limits_upper, device=self.device)
@@ -138,17 +178,16 @@ class Humanoid_G1(Humanoid_SMPLX):
 
         return
     
-    def _process_rigid_shape_props(self, props, env_id):
-        """Callback allowing to store/change/randomize the rigid shape properties of each environment.
-            Called During environment creation.
+    def _process_rigid_shape_props(self, env_id):
+        """Friction of the robot shapes of environment ``env_id`` (None keeps the default of 1.0).
+            Called once per environment after the scene has been created.
             Base behavior: randomizes the friction of each environment
 
         Args:
-            props (List[gymapi.RigidShapeProperties]): Properties of each shape of the asset
             env_id (int): Environment id
 
         Returns:
-            [List[gymapi.RigidShapeProperties]]: Modified rigid shape properties
+            [float | None]: friction coefficient (static and dynamic) of every robot shape
         """
         # NOTE: The default friction is all set to 1.0
         if self.cfg['domain_rand']['randomize_friction'] and self.cfg['domain_rand']['domain_rand_general']:
@@ -161,148 +200,48 @@ class Humanoid_G1(Humanoid_SMPLX):
                     friction_range[0], friction_range[1], (num_buckets, 1), device="cpu"
                 )
                 self.friction_coeffs = friction_buckets[bucket_ids]
-            for s in range(len(props)):
-                props[s].friction = self.friction_coeffs[env_id]
-        return props
+            return float(self.friction_coeffs[env_id])
+        return None
     
-    def _process_rigid_body_props(self, props, env_id):
-        # No need to use tensors as only called upon env creation
+    def _process_rigid_body_props(self, env_id):
+        # Randomize the torso mass / centre of mass of one environment (CPU property buffers).
         if self.cfg['domain_rand']['randomize_base_mass'] and self.cfg['domain_rand']['domain_rand_general']:
             rng_mass = self.cfg['domain_rand']['added_mass_range']
             rand_mass = np.random.uniform(rng_mass[0], rng_mass[1], size=(1,))
-            props[self.torso_idx].mass += rand_mass
+            self._env_robot_masses[env_id, self.torso_idx] += float(rand_mass[0])
         else:
             rand_mass = np.zeros((1,))
         if self.cfg['domain_rand']['randomize_base_com'] and self.cfg['domain_rand']['domain_rand_general']:
             rng_com = self.cfg['domain_rand']['added_com_range']
             rand_com = np.random.uniform(rng_com[0], rng_com[1], size=(3,))
-            props[self.torso_idx].com += gymapi.Vec3(*rand_com)
+            self._env_robot_coms[env_id, self.torso_idx] += torch.as_tensor(rand_com, dtype=self._env_robot_coms.dtype)
         else:
             rand_com = np.zeros(3)
         mass_params = np.concatenate([rand_mass, rand_com])
-        return props, mass_params
+        return mass_params
         
     def _build_env(self, env_id, env_ptr, humanoid_asset):
-        col_group = env_id
-        col_filter = self._get_humanoid_collision_filter()
-        segmentation_id = 0
-
-        start_pose = gymapi.Transform()
-        asset_file = self.robot_type
-        char_h = 0.89
-
-        start_pose.p = gymapi.Vec3(*get_axis_params(char_h, self.up_axis_idx))
-        start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
-
-        rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(humanoid_asset)
-        rigid_shape_props = self._process_rigid_shape_props(rigid_shape_props_asset, env_id)
-        self.gym.set_asset_rigid_shape_properties(humanoid_asset, rigid_shape_props)
-
-
-        humanoid_handle = self.gym.create_actor(env_ptr, humanoid_asset, start_pose, "humanoid", col_group, col_filter, segmentation_id)
-
-        self.gym.enable_actor_dof_force_sensors(env_ptr, humanoid_handle)
+        friction = self._process_rigid_shape_props(env_id)
+        if friction is not None:
+            if self._env_robot_friction is None:
+                self._env_robot_friction = torch.ones(self.num_envs)
+            self._env_robot_friction[env_id] = friction
 
         if (self._pd_control):
-            dof_prop = self.gym.get_asset_dof_properties(humanoid_asset)
-            dof_prop["driveMode"] = (gymapi.DOF_MODE_POS if self.cfg["env"].get("retargetPositionControl", False) else gymapi.DOF_MODE_EFFORT)
-            # stiffness = [
-            #     150, 150, 
-            #     200, 200,
-            #     20, 20,
-            #     150, 150,
-            #     200, 200,
-            #     20, 20,
-            #     200, 200, 200,
-            #     40 ,40 ,40 ,40, 20 ,20 ,20,
-            #     40 ,40 ,40 ,40, 20 ,20 ,20,
-            # ]
-            # damping = [
-            #     5, 5, 5, 5,
-            #     4, 4,
-            #     5, 5, 5, 5,
-            #     4, 4,
-            #     5, 5, 5,
-            #     10, 10, 10, 10, 0.5, 0.5, 0.5,
-            #     10, 10, 10, 10, 0.5, 0.5, 0.5,    
-            # ]
-            # Kp (stiffness) per DOF
-            stiffness = [40.179238, 99.098428, 40.179238, 99.098428, 28.501246, 28.501246,
-                        40.179238, 99.098428, 40.179238, 99.098428, 28.501246, 28.501246,
-                        40.179238, 28.501246, 28.501246,
-                        14.250623, 14.250623, 14.250623, 14.250623, 14.250623, 16.778327, 16.778327,
-                        14.250623, 14.250623, 14.250623, 14.250623, 14.250623, 16.778327, 16.778327]
+            # Drive mode, effort limits, armature and (for retargetPositionControl) the PD gains are set on the
+            # articulation from the G1_* tables above (see RobotSpec in _create_envs).
+            if env_id == 0:
+                stiffness, damping, effort = G1_STIFFNESS, G1_DAMPING, G1_EFFORT
+                action_scale = [e/k for e, k in zip(effort, stiffness)]
+                self.p_gains = torch.tensor(stiffness, device=self.device, dtype=torch.float32)
+                self.d_gains = torch.tensor(damping, device=self.device, dtype=torch.float32)
+                self.torque_limits = torch.tensor(effort, device=self.device, dtype=torch.float32) * 0.8
+                self.action_scale = torch.tensor(action_scale, device=self.device, dtype=torch.float32)
+            mass_params = self._process_rigid_body_props(env_id)
 
-            # Kd (damping) per DOF
-            damping = [2.557890, 6.308802, 2.557890, 6.308802, 1.814446, 1.814446,
-                    2.557890, 6.308802, 2.557890, 6.308802, 1.814446, 1.814446,
-                    2.557890, 1.814446, 1.814446,
-                    0.907223, 0.907223, 0.907223, 0.907223, 0.907223, 1.068142, 1.068142,
-                    0.907223, 0.907223, 0.907223, 0.907223, 0.907223, 1.068142, 1.068142]
-
-            # armature per DOF (NOTE: feet + waist roll/pitch are doubled vs ARMATURE_5020)
-            armature = [0.010178, 0.025102, 0.010178, 0.025102, 0.007219, 0.007219,
-                        0.010178, 0.025102, 0.010178, 0.025102, 0.007219, 0.007219,
-                        0.010178, 0.007219, 0.007219,
-                        0.003610, 0.003610, 0.003610, 0.003610, 0.003610, 0.004250, 0.004250,
-                        0.003610, 0.003610, 0.003610, 0.003610, 0.003610, 0.004250, 0.004250]
-
-            # effort limits per DOF (used for dof_prop["effort"] and for torque_limits)
-            effort = [88.0, 139.0, 88.0, 139.0, 50.0, 50.0,
-                    88.0, 139.0, 88.0, 139.0, 50.0, 50.0,
-                    88.0, 50.0, 50.0,
-                    25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0,
-                    25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0]
-            action_scale = [e/k for e, k in zip(effort, stiffness)]
-            dof_prop["effort"] = effort
-            if self.cfg["env"].get("retargetPositionControl", False):
-                dof_prop["stiffness"] = stiffness
-                dof_prop["damping"] = damping
-            # dof_armature_29 = [0.0103, 0.0251, 0.0103, 0.0251, 0.003597, 0.003597] * 2 + [0.0103] * 3 + [0.003597] * 14       # 8 (original small joints) + 4 (extra wrist DoF)
-            dof_prop["armature"] = armature
-            self.gym.set_actor_dof_properties(env_ptr, humanoid_handle, dof_prop)
-            body_props = self.gym.get_actor_rigid_body_properties(env_ptr, humanoid_handle)
-            body_props, mass_params = self._process_rigid_body_props(body_props, env_id)
-            self.gym.set_actor_rigid_body_properties(
-                env_ptr, humanoid_handle, body_props, recomputeInertia=True
-            )
-
-            self.p_gains = torch.tensor(stiffness, device=self.device, dtype=torch.float32)
-            self.d_gains = torch.tensor(damping, device=self.device, dtype=torch.float32)
-            self.torque_limits = torch.tensor(dof_prop["effort"], device=self.device, dtype=torch.float32) * 0.8
-            self.action_scale = torch.tensor(action_scale, device=self.device, dtype=torch.float32)
-                    
-        # fetch all the data
-        shape_props        = self.gym.get_actor_rigid_shape_properties(env_ptr, humanoid_handle)
-        body_names         = self.gym.get_actor_rigid_body_names(env_ptr, humanoid_handle)
-        body_shape_indices = self.gym.get_actor_rigid_body_shape_indices(env_ptr, humanoid_handle)
-
-        # for each body, modify the filter on every shape in its range
-        for body_idx, idx_range in enumerate(body_shape_indices):
-            name = body_names[body_idx]
-            start, count = idx_range.start, idx_range.count
-            # print(name, start, count)
-            for si in range(start, start + count):
-                sp = shape_props[si]
-                if 'right' in name:
-                    if 'ankle' in name:
-                        sp.filter = 2
-                    elif 'knee' in name:
-                        sp.filter = 6
-                    elif 'hip' in name:
-                        sp.filter = 12
-                if 'left' in name:
-                    if 'ankle' in name:
-                        sp.filter = 16
-                    elif 'knee' in name:
-                        sp.filter = 48
-                    elif 'hip' in name:
-                        sp.filter = 96
-                # print(name, si, sp.filter)
-
-        # write them back
-        self.gym.set_actor_rigid_shape_properties(env_ptr, humanoid_handle, shape_props)
-        self.humanoid_handles.append(humanoid_handle)
+        # The leg collision filters of Isaac Gym (right ankle 2, knee 6, hip 12; left ankle 16, knee 48, hip 96)
+        # are authored in the robot USD as filtered link pairs (see g1_collision_filter / RobotSpec).
+        self.humanoid_handles[env_id] = 0
 
         return
 

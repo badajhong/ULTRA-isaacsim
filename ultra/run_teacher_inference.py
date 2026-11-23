@@ -8,12 +8,10 @@ import sys
 repo = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo / "ultra"))
 
-import isaacgym  # noqa: F401; Isaac Gym must be imported before torch.
-import torch
-from learning import ultra_players
-
 
 def run_rollout(self):
+    import torch
+
     task = self.env.task
     source = Path(task.motion_file[0])
     source_frames = int(task.max_episode_length[0]) - 20  # loader pads the last frame
@@ -64,6 +62,10 @@ def main():
     os.environ["WANDB_DISABLED"] = "true"
     os.environ["ULTRA_TEACHER_OUTPUT_DIR"] = str(output_dir)
     os.chdir(repo)
+    # Start Isaac Sim (headless) before importing anything that uses it; ultra/run.py reuses this app.
+    from env.sim.app import launch_app
+    launch_app(headless=True)
+    from learning import ultra_players
     ultra_players.UltraPlayerContinuous.run = run_rollout
     sys.argv = [str(repo / "ultra/run.py"),
                 "--task", "UltraG1Retarget",

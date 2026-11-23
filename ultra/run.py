@@ -30,6 +30,12 @@ import os
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 from utils.config import set_np_formatting, set_seed, get_args, parse_sim_params, load_cfg
+from env.sim.app import launch_app_from_args, run_and_close
+
+# Isaac Sim must be running before Isaac Lab (and therefore the task modules) can be imported.
+args = get_args()
+simulation_app = launch_app_from_args(args)
+
 from utils.parse_task import parse_task
 
 from rl_games.algos_torch import torch_ext
@@ -46,7 +52,7 @@ from learning import ultra_players
 from learning import ultra_models
 from learning import ultra_network_builder
 
-args = None
+# ``args`` is parsed above, before Isaac Sim starts
 cfg = None
 cfg_train = None
 
@@ -90,7 +96,7 @@ def create_rlgpu_env(**kwargs):
         cfg['rank'] = rank
         cfg['rl_device'] = f'cuda:{local_rank}'
     else:
-        # Isaac Gym expects CUDA; this is just a safe fallback
+        # the Isaac Sim GPU pipeline expects CUDA; this is just a safe fallback
         args.device = 'cpu'
         args.device_id = -1
         args.rl_device = 'cpu'
@@ -218,7 +224,6 @@ def main():
     global cfg_train
 
     set_np_formatting()
-    args = get_args()
     cfg, cfg_train, logdir = load_cfg(args)
 
     cfg_train['params']['seed'] = set_seed(cfg_train['params'].get("seed", -1), cfg_train['params'].get("torch_deterministic", False))
@@ -291,4 +296,4 @@ def main():
     return
 
 if __name__ == '__main__':
-    main()
+    run_and_close(main)

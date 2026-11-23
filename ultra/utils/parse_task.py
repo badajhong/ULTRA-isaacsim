@@ -32,8 +32,6 @@ from env.tasks.ultra_g1_retarget import UltraG1Retarget
 from env.tasks.ultra_g1_distill_obj_v2vae import UltraDistillObjV2Point
 from env.tasks.vec_task_wrappers import VecTaskPythonWrapper, VecTaskDAggerWrapper
 
-from isaacgym import rlgpu
-
 import numpy as np
 
 

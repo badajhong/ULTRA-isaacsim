@@ -31,9 +31,10 @@ from rl_games.algos_torch import torch_ext
 from learning import a2c_common
 import psutil
 import subprocess
-from isaacgym.torch_utils import *
+from utils.sim_torch_utils import *
 
 import time
+from collections import deque
 from datetime import datetime
 import numpy as np
 from torch import optim
@@ -45,6 +46,14 @@ from torch.nn.utils import clip_grad_norm_
 import learning.common_agent as common_agent
 
 from tensorboardX import SummaryWriter
+
+
+def _fmt_duration(seconds):
+    seconds = int(max(seconds, 0))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    return f"{days}d{hours:02d}h{minutes:02d}m" if days else f"{hours}h{minutes:02d}m"
 
 
 class UltraAgent(common_agent.CommonAgent):
@@ -181,6 +190,13 @@ class UltraAgent(common_agent.CommonAgent):
 
         model_output_file = os.path.join(self.nn_dir, self.config['name'])
 
+        # (wall time, epoch) of recent epochs; the ETA uses their mean epoch time,
+        # which includes env stepping, updates, logging and checkpointing.
+        epoch_times = deque(maxlen=50)
+        # The student's LR and observation-masking curricula both end at lr_decay_end.
+        curriculum_end = (int(self.config.get('lr_decay_end', 0))
+                          if self.config.get('lr_schedule') == 'curriculum' else 0)
+
         # --- NEW: init/process DDP world (no Horovod) ---
         self._maybe_init_ddp()
 
@@ -224,9 +240,12 @@ class UltraAgent(common_agent.CommonAgent):
                 if self.print_stats:
                     fps_step = global_curr_frames / scaled_play_time
                     fps_total = global_curr_frames / scaled_time
+                    now = time.time()
+                    epoch_times.append((now, epoch_num))
                     print(
                         f"epoch_num:{epoch_num} mean_rewards:{self._get_mean_rewards()} "
-                        f"fps step: {fps_step:.1f} fps total: {fps_total:.1f}"
+                        f"fps step: {fps_step:.1f} fps total: {fps_total:.1f} | "
+                        + self._progress_str(epoch_num, now - start_time, epoch_times, curriculum_end)
                     )
 
                 self.writer.add_scalar('performance/total_fps', global_curr_frames / scaled_time, self.frame)
@@ -282,7 +301,23 @@ class UltraAgent(common_agent.CommonAgent):
                 return self.last_mean_rewards, epoch_num
         # not reached
         return
-    
+
+    def _progress_str(self, epoch_num, elapsed, epoch_times, curriculum_end):
+        """Elapsed wall time, mean epoch time, and time left to curriculum_end and max_epochs."""
+        parts = [f"elapsed {_fmt_duration(elapsed)}"]
+        (t0, e0), (t1, e1) = epoch_times[0], epoch_times[-1]
+        if e1 > e0:
+            sec_per_epoch = (t1 - t0) / (e1 - e0)
+            parts.append(f"{sec_per_epoch:.1f}s/epoch")
+            if epoch_num < curriculum_end:
+                left = (curriculum_end - epoch_num) * sec_per_epoch
+                parts.append(f"to curriculum end ({curriculum_end}): {_fmt_duration(left)}")
+            max_epochs = int(self.max_epochs)
+            left = max(max_epochs - epoch_num, 0) * sec_per_epoch
+            finish = datetime.fromtimestamp(t1 + left).strftime('%Y-%m-%d %H:%M')
+            parts.append(f"left to max_epochs ({max_epochs}): {_fmt_duration(left)}, done ~{finish}")
+        return " | ".join(parts)
+
     def init_tensors(self):
         super().init_tensors()
         self._build_rand_action_probs()

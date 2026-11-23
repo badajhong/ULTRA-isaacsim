@@ -3,7 +3,7 @@
 # Usage: scripts/sim2sim_student.sh <ckpt.pth|jit.pt> <motion_dir> [task_mode] [obj_obs] [extra sim2sim_vae.py args...]
 #   task_mode: full_track | sparse_track | object_obs ; obj_obs: points | pos | none
 #   NOTE: the MuJoCo full_track preset hides the object modalities and the command goal (pure humanoid
-#   reference tracking); the IsaacGym full_track preset keeps everything visible.
+#   reference tracking); the Isaac Sim full_track preset keeps everything visible.
 # Add --use_jit when passing a JIT model exported with ultra/export_jit.py (auto-detected for .pt files).
 set -e
 cd "$(dirname "$0")/.."

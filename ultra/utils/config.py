@@ -26,15 +26,14 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import argparse
 import os
-import yaml
-
-from isaacgym import gymapi
-from isaacgym import gymutil
+import random
 
 import numpy as np
-import random
-import torch
+import yaml
+
+from env.sim.sim_params import SimParams, parse_sim_config
 
 SIM_TIMESTEP = 1.0 / 1000.0
 
@@ -50,6 +49,8 @@ def warn_task_name():
 
 
 def set_seed(seed, torch_deterministic=False):
+    import torch
+
     if seed == -1 and torch_deterministic:
         seed = 42
     elif seed == -1:
@@ -68,7 +69,7 @@ def set_seed(seed, torch_deterministic=False):
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
-        torch.set_deterministic(True)
+        torch.use_deterministic_algorithms(True)
     else:
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
@@ -111,7 +112,7 @@ def load_cfg(args):
 
     if args.experiment != 'Base':
         if args.metadata:
-            exp_name = "{}_{}_{}_{}".format(args.experiment, args.task_type, args.device, str(args.physics_engine).split("_")[-1])
+            exp_name = "{}_{}_{}_{}".format(args.experiment, args.task_type, args.device, args.physics_engine)
 
             if cfg["task"]["randomize"]:
                 exp_name += "_DR"
@@ -149,37 +150,70 @@ def load_cfg(args):
 
 def parse_sim_params(args, cfg, cfg_train):
     # initialize sim
-    sim_params = gymapi.SimParams()
+    sim_params = SimParams()
     sim_params.dt = SIM_TIMESTEP
     sim_params.num_client_threads = args.slices
 
-    if args.physics_engine == gymapi.SIM_FLEX:
-        if args.device != "cpu":
-            print("WARNING: Using Flex with GPU instead of PHYSX!")
-        sim_params.flex.shape_collision_margin = 0.01
-        sim_params.flex.num_outer_iterations = 4
-        sim_params.flex.num_inner_iterations = 10
-    elif args.physics_engine == gymapi.SIM_PHYSX:
-        sim_params.physx.solver_type = 1
-        sim_params.physx.num_position_iterations = 4
-        sim_params.physx.num_velocity_iterations = 0
-        sim_params.physx.num_threads = 4
-        sim_params.physx.use_gpu = args.use_gpu
-        sim_params.physx.num_subscenes = args.subscenes
-        sim_params.physx.max_gpu_contact_pairs = 8 * 1024 * 1024
+    sim_params.physx.solver_type = 1
+    sim_params.physx.num_position_iterations = 4
+    sim_params.physx.num_velocity_iterations = 0
+    sim_params.physx.num_threads = 4
+    sim_params.physx.use_gpu = args.use_gpu
+    sim_params.physx.num_subscenes = args.subscenes
+    sim_params.physx.max_gpu_contact_pairs = 8 * 1024 * 1024
 
     sim_params.use_gpu_pipeline = args.use_gpu_pipeline
-    sim_params.physx.use_gpu = args.use_gpu
 
     # if sim options are provided in cfg, parse them and update/override above:
     if "sim" in cfg:
-        gymutil.parse_sim_config(cfg["sim"], sim_params)
+        parse_sim_config(cfg["sim"], sim_params)
 
     # Override num_threads if passed on the command line
-    if args.physics_engine == gymapi.SIM_PHYSX and args.num_threads > 0:
+    if args.num_threads > 0:
         sim_params.physx.num_threads = args.num_threads
 
     return sim_params
+
+
+def _parse_device_str(device_str):
+    if device_str in ("cpu", "cuda"):
+        return device_str, 0
+    device, _, device_id = device_str.partition(":")
+    if device != "cuda" or not device_id.isdigit():
+        raise ValueError(f'Invalid device string "{device_str}"')
+    return device, int(device_id)
+
+
+def parse_arguments(description="ULTRA", custom_parameters=()):
+    """Command line of the former Isaac Gym scripts (``gymutil.parse_arguments``) plus Isaac Sim options."""
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--sim_device", type=str, default="cuda:0", help="Physics device in PyTorch-like syntax")
+    parser.add_argument("--pipeline", type=str, default="gpu", help="Tensor pipeline (cpu/gpu)")
+    parser.add_argument("--graphics_device_id", type=int, default=0, help="Unused; kept for compatibility")
+    parser.add_argument("--physx", action="store_true", help="Unused; PhysX is the only engine")
+    parser.add_argument("--num_threads", type=int, default=0, help="Unused by Isaac Sim; kept for compatibility")
+    parser.add_argument("--subscenes", type=int, default=0, help="Unused; kept for compatibility")
+    parser.add_argument("--slices", type=int, help="Unused; kept for compatibility")
+    parser.add_argument("--enable_cameras", action="store_true",
+                        help="Enable Isaac Sim rendering in headless mode (headless image capture)")
+    for argument in custom_parameters:
+        kwargs = {k: v for k, v in argument.items() if k != "name"}
+        parser.add_argument(argument["name"], **kwargs)
+    args = parser.parse_args()
+
+    args.sim_device_type, args.compute_device_id = _parse_device_str(args.sim_device)
+    pipeline = args.pipeline.lower()
+    assert pipeline in ("cpu", "gpu", "cuda"), f"Invalid pipeline '{args.pipeline}'. Should be either cpu or gpu."
+    args.use_gpu_pipeline = pipeline in ("gpu", "cuda")
+    if args.sim_device_type != "cuda" and args.use_gpu_pipeline:
+        print("Can't use GPU pipeline with CPU Physics. Changing pipeline to 'CPU'.")
+        args.pipeline = "CPU"
+        args.use_gpu_pipeline = False
+    args.physics_engine = "physx"
+    args.use_gpu = args.sim_device_type == "cuda"
+    if args.slices is None:
+        args.slices = args.subscenes
+    return args
 
 
 def get_args(benchmark=False):
@@ -265,7 +299,7 @@ def get_args(benchmark=False):
                               {"name": "--bench_file", "action": "store", "help": "Filename to store benchmark results"}]
 
     # parse arguments
-    args = gymutil.parse_arguments(
+    args = parse_arguments(
         description="RL Policy",
         custom_parameters=custom_parameters)
 

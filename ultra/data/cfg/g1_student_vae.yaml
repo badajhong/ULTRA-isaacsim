@@ -1,4 +1,4 @@
-# if given, will override the device setting in gym. 
+# ULTRA environment configuration (Isaac Sim backend, see ultra/env/sim/backend.py).
 env: 
   numEnvs: 4096
   envSpacing: 2
@@ -181,6 +181,10 @@ sim:
     max_depenetration_velocity: 1.0    # ← allows reasonable correction without jumpiness
     # default_buffer_size_multiplier: 20.0
     # max_gpu_contact_pairs: 16777216
+    # Isaac Sim PhysX GPU buffers, enlarged for large env counts (backend defaults: 2**20 / 2**23 / 2**23)
+    gpu_max_rigid_patch_count: 4194304            # 2**22
+    gpu_found_lost_pairs_capacity: 16777216       # 2**24
+    gpu_total_aggregate_pairs_capacity: 16777216  # 2**24
 
   flex:
     num_inner_iterations: 10

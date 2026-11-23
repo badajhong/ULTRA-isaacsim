@@ -1,4 +1,4 @@
-# if given, will override the device setting in gym.
+# ULTRA environment configuration (Isaac Sim backend, see ultra/env/sim/backend.py).
 env:
   numEnvs: 4096
   envSpacing: 2

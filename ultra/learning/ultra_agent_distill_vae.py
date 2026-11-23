@@ -28,7 +28,7 @@
 
 from rl_games.algos_torch import torch_ext
 from learning import a2c_common
-from isaacgym.torch_utils import *
+from utils.sim_torch_utils import *
 
 import numpy as np
 import torch 
