@@ -355,7 +355,10 @@ class UltraG1Retarget(Humanoid_G1, Ultra):
     
     def _reset_ref_state_init(self, env_ids):
         num_envs = env_ids.shape[0]
-        i = to_torch([_ % self.num_motions for _ in env_ids], device=self.device, dtype=torch.long)
+        if hasattr(self, '_eval_motion_ids'):
+            i = self._eval_motion_ids[env_ids]
+        else:
+            i = to_torch([_ % self.num_motions for _ in env_ids], device=self.device, dtype=torch.long)
 
         if (self._state_init == Ultra.StateInit.Random
             or self._state_init == Ultra.StateInit.Hybrid):
@@ -430,7 +433,10 @@ class UltraG1Retarget(Humanoid_G1, Ultra):
 
     def _reset_hybrid_state_init(self, env_ids):
         num_envs = env_ids.shape[0]
-        i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
+        if hasattr(self, '_eval_motion_ids'):
+            i = self._eval_motion_ids[env_ids]
+        else:
+            i = to_torch([torch.where(self.obj2motion[i % len(self.object_name)] == 1)[0][torch.randint(self.obj2motion[i % len(self.object_name)].sum(), ())] for i in env_ids], device=self.device, dtype=torch.long)
         ref_probs = to_torch(np.array([self._hybrid_init_prob] * num_envs), device=self.device)
         ref_init_mask = torch.bernoulli(ref_probs) == 1.0
 

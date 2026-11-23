@@ -217,7 +217,15 @@ def build_alg_runner(algo_observer):
         agent = ultra_agent_distill_vae.UltraAgentDistill
         builder = ultra_network_builder_obj_v2.UltraBuilder
     runner.algo_factory.register_builder('ultra', lambda **kwargs: agent(**kwargs))
-    runner.player_factory.register_builder('ultra', lambda **kwargs : ultra_players_distill.UltraPlayerContinuousDistill(**kwargs))
+    if args.eval_episodes:
+        from learning.tracking_evaluator import TrackingSuccessPlayer
+        runner.player_factory.register_builder('ultra', lambda **kwargs: TrackingSuccessPlayer(
+            episodes=args.eval_episodes, full_clips=args.eval_full_clips, output=args.eval_output,
+            checkpoint=args.checkpoint, motion_dir=args.motion_file, seed=args.seed,
+            training_conditions=args.eval_training_conditions, eval_policy=args.eval_policy,
+            horizon_length=cfg_train['params']['config']['horizon_length'], **kwargs))
+    else:
+        runner.player_factory.register_builder('ultra', lambda **kwargs : ultra_players_distill.UltraPlayerContinuousDistill(**kwargs))
     runner.model_builder.model_factory.register_builder('ultra', lambda network, **kwargs : ultra_models.ModelUltraContinuous(network))
     runner.model_builder.network_factory.register_builder('ultra', lambda **kwargs: builder())
 
@@ -230,6 +238,13 @@ def main():
 
     set_np_formatting()
     cfg, cfg_train, logdir = load_cfg(args)
+
+    if args.eval_episodes and (args.eval_episodes < 0 or not args.test or args.task != 'UltraDistillObjV2Point'):
+        raise ValueError('--eval_episodes requires a positive count, --test and task UltraDistillObjV2Point')
+    if args.eval_full_clips and not args.eval_episodes:
+        raise ValueError('--eval_full_clips requires --eval_episodes and --test')
+    if args.eval_training_conditions and (not args.eval_full_clips or args.task_mode):
+        raise ValueError('--eval_training_conditions requires --eval_full_clips and no fixed --task_mode')
 
     if args.resume_from:
         cfg_train['params']['config']['resume_from'] = args.resume_from

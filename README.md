@@ -174,6 +174,60 @@ scripts/sim2sim_student.sh <student.pth> InterAct/OMOMO_retarget_aug full_track 
 scripts/export_jit.sh <student.pth> student_jit.pt      # TorchScript export
 ```
 
+For a sampled, headless tracking success estimate (humanoid and humanoid + object):
+
+```bash
+scripts/eval_student.sh models/g1_student_vae_00005500.pth 16 100
+```
+
+The arguments after the checkpoint are the parallel environment count and completed episode count. The evaluator
+uses `full_track`, seed 42, and the student configuration's domain randomization. It counts an episode as a humanoid
+success if it does not terminate early and the mean global distance over 39 body origins stays below 0.3 m at every
+evaluated step; combined success additionally requires object-center position error below 0.3 m at every step.
+Episodes use the existing training sampler, including random starting frames and rollouts of at most 300 steps; they
+do not systematically cover every clip. Use `--motion_file <directory>` after the episode count to select another
+motion set, or `--seed <number>` to change the seed. This is an approximate tracking evaluation, not a reproduction
+of Table I: the original ID/OOD splits, exact body/joint definition, and Isaac Gym evaluation protocol are not provided
+here, and this repository uses Isaac Sim.
+
+To evaluate each motion in a directory once from its first frame and write a Table I-style report:
+
+```bash
+scripts/eval_table1.sh models/g1_student_vae_00005500.pth InterAct/OMOMO_retarget_aug 16 output/table1_metrics.json
+```
+
+Use a separate directory and output path for each ID or OOD set; this script does not infer a split. The environment
+count must be at least the number of distinct object type/scale combinations in the motion directory. Loading a large
+motion set can require substantial GPU memory. A JSON report contains settings and one result per clip; the terminal
+prints a summary. Runs use full tracking, seed 42, the configured domain randomization, and mean actions with a
+sampled VAE latent. Use `--seed <number>` after the output path to repeat with another seed.
+
+The reported quantities are an **approximation**, not official Table I results. The two success rates use 0.3 m
+thresholds at every simulated step, starting after the initial frame. Body errors use 39 body origins; the local
+error subtracts each root position without rotational alignment. Object rotation is quaternion geodesic angle in
+degrees. Jitter is the magnitude of the third finite difference of world body positions in m/s³. Errors are averaged
+over simulated frames, including failed clips only up to termination. The 20 training padding frames are excluded.
+The paper does not specify enough details here to verify exact joint sets, jitter, aggregation, or evaluation splits;
+its reported experiments use Isaac Gym, whereas this repository uses Isaac Sim. The script does not calculate the
+paper's reported uncertainty from repeated independent runs.
+
+For a diagnostic closer to the student **training environment**, evaluate each supplied clip once using training's
+hybrid random-start reset, 300-step rollout limit, stand-still sampling, domain randomization and observation-mask
+curriculum at the checkpoint's saved epoch:
+
+```bash
+scripts/eval_training_conditions.sh models/g1_student_vae_00005500.pth InterAct/OMOMO_retarget_aug 16 output/training_prior.json prior
+scripts/eval_training_conditions.sh models/g1_student_vae_00005500.pth InterAct/OMOMO_retarget_aug 16 output/training_encoder.json encoder
+```
+
+`prior` tests the deployable student; `encoder` is a privileged diagnostic using teacher observations, as in the
+training encoder path. Both use mean student actions and do not mix in teacher actions, so neither reproduces the
+training rollout policy exactly. The per-rank curriculum step counter is estimated as saved epoch times configured
+horizon because it is not saved in the checkpoint. Clips start at random frames and may include the loader's 20
+padding frames; each clip is sampled only once, so this is neither full-trajectory coverage nor the paper's Table I.
+Random draws and resets can diverge between the two policy runs even with the same seed. The success metric retains
+the approximate 0.3 m conditions described above.
+
 ## 📄 License
 
 ULTRA's own code is released under Apache-2.0 (top-level `LICENSE`); the InterMimic-derived simulation and learning

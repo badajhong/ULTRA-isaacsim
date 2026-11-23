@@ -586,7 +586,10 @@ def _spawn_ground_plane(prim_path, cfg, translation=None, orientation=None, **kw
 
     stage = get_current_stage()
     root = UsdGeom.Xform.Define(stage, prim_path)
-    sim_utils.standardize_xform_ops(root.GetPrim(), translation=translation, orientation=orientation)
+    if translation is not None:
+        root.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(*translation))
+    if orientation is not None:
+        root.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Quatd(*orientation))
     plane = UsdGeom.Plane.Define(stage, f"{prim_path}/collisionPlane")
     plane.CreateAxisAttr().Set(UsdGeom.Tokens.z)
     plane.CreateWidthAttr().Set(cfg.size)
