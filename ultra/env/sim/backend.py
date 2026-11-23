@@ -586,7 +586,12 @@ def _spawn_ground_plane(prim_path, cfg, translation=None, orientation=None, **kw
 
     stage = get_current_stage()
     root = UsdGeom.Xform.Define(stage, prim_path)
-    sim_utils.standardize_xform_ops(root.GetPrim(), translation=translation, orientation=orientation)
+    # Isaac Lab's XformPrimView expects all three operations in this order.
+    translation = (0.0, 0.0, 0.0) if translation is None else translation
+    orientation = (1.0, 0.0, 0.0, 0.0) if orientation is None else orientation
+    root.AddTranslateOp().Set(Gf.Vec3d(*translation))
+    root.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Quatd(*orientation))
+    root.AddScaleOp().Set(Gf.Vec3f(1.0, 1.0, 1.0))
     plane = UsdGeom.Plane.Define(stage, f"{prim_path}/collisionPlane")
     plane.CreateAxisAttr().Set(UsdGeom.Tokens.z)
     plane.CreateWidthAttr().Set(cfg.size)
