@@ -196,14 +196,30 @@ To evaluate each motion in a directory once from its first frame and write a Tab
 scripts/eval_table1.sh models/g1_student_vae_00005500.pth InterAct/OMOMO_retarget_aug 16 output/table1_metrics.json
 ```
 
+To evaluate a privileged teacher using the same tracking conditions, pass its checkpoint and select the teacher policy:
+
+```bash
+scripts/eval_table1.sh ultra/weights/teacher_ultra_inference.pth InterAct/OMOMO_retarget_aug \
+  1024 output/teacher_table1.json --eval_policy teacher
+```
+
+The teacher receives its unmasked normalized privileged observation and uses its mean action. Its weights are loaded
+by the environment; the student network constructed by the evaluation runner does not select actions.
+
 Use a separate directory and output path for each ID or OOD set; this script does not infer a split. The environment
 count must be at least the number of distinct object type/scale combinations in the motion directory. Loading a large
 motion set can require substantial GPU memory. A JSON report contains settings and one result per clip; the terminal
-prints a summary. Runs use full tracking, seed 42, the configured domain randomization, and mean actions with a
-sampled VAE latent. Use `--seed <number>` after the output path to repeat with another seed.
+prints a summary. Runs use full tracking, seed 42, and nominal physics/sensing (`--eval_randomization nominal`):
+training pushes, physical randomization, reset perturbations, and observation noise are disabled. Object mass,
+COM, and inertia randomization are also disabled explicitly because those task settings bypass the general
+randomization flag. Student actions use the mean decoder output with a sampled prior latent.
+Use `--seed <number>` after the output path to repeat with another seed. Append `--eval_randomization config`
+to retain the YAML's randomization, as older versions of this script did. `eval_training_conditions.sh` continues
+to use the training configuration. These are different evaluation conditions and should be reported separately;
+nominal mode is a declared tracking benchmark, not a claim that the paper's unreleased protocol is identical.
 
 The reported quantities are an **approximation**, not official Table I results. The two success rates use 0.3 m
-thresholds at every simulated step, starting after the initial frame. Body errors use 39 body origins; the local
+thresholds at every frame, including the initial reference frame. Body errors use 39 body origins; the local
 error subtracts each root position without rotational alignment. Object rotation is quaternion geodesic angle in
 degrees. Jitter is the magnitude of the third finite difference of world body positions in m/s³. Errors are averaged
 over simulated frames, including failed clips only up to termination. The 20 training padding frames are excluded.
@@ -227,6 +243,32 @@ horizon because it is not saved in the checkpoint. Clips start at random frames 
 padding frames; each clip is sampled only once, so this is neither full-trajectory coverage nor the paper's Table I.
 Random draws and resets can diverge between the two policy runs even with the same seed. The success metric retains
 the approximate 0.3 m conditions described above.
+
+The tracking evaluation scripts also accept checkpoints produced by `scripts/train_finetune.sh`. They automatically
+detect the V3 finetune architecture, load its complete FiLM adapter and separate critic with strict weight matching,
+and select `g1_student_finetune.yaml` for the network. The simulation still uses the same V2 tracking task and
+`g1_student_vae.yaml` environment as distilled students, so it measures reference tracking rather than the V3
+training task's perturbed-goal success. The optional `--eval_model finetune` asserts the detected architecture;
+custom `--cfg_train` files are preserved.
+
+```bash
+# Same tracking-environment diagnostic as the distilled student; deployed prior policy.
+scripts/eval_training_conditions.sh \
+  models/g1_student_finetune_00006000.pth InterAct/OMOMO_retarget_aug \
+  1024 output/finetune_prior_6000.json prior
+
+# All supplied clips from frame zero, with the full_track observation preset.
+scripts/eval_table1.sh \
+  models/g1_student_finetune_00006000.pth InterAct/OMOMO_retarget_aug \
+  1024 output/finetune_table1_6000.json
+```
+
+Here `1024` is the parallel environment count; every clip in the supplied directory is evaluated once. For the
+training-environment diagnostic, the mask curriculum uses the saved checkpoint epoch and the estimated step counter
+uses that epoch times the selected training configuration's horizon (16 for finetune, 8 for distillation). Both
+use the tracking environment's 300-step rollout cap and its observation-mask probabilities. The JSON records the
+model type, environment/network configs, horizon and protocol alongside the approximate success rates. Use a new
+output filename for each checkpoint and policy.
 
 ## 📄 License
 

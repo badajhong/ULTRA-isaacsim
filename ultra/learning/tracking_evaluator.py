@@ -12,7 +12,8 @@ from learning.ultra_players_distill import UltraPlayerContinuousDistill
 
 class TrackingSuccessPlayer(UltraPlayerContinuousDistill):
     def __init__(self, config, episodes, full_clips=False, output='', checkpoint='', motion_dir='', seed=None,
-                 training_conditions=False, eval_policy='prior', horizon_length=8):
+                 training_conditions=False, eval_policy='prior', horizon_length=8,
+                 model_type='distillation', checkpoint_epoch=None, env_config='', train_config=''):
         super().__init__(config)
         self.eval_episodes = episodes
         self.full_clips = full_clips
@@ -23,8 +24,23 @@ class TrackingSuccessPlayer(UltraPlayerContinuousDistill):
         self.training_conditions = training_conditions
         self.eval_policy = eval_policy
         self.horizon_length = horizon_length
+        self.model_type = model_type
+        self.checkpoint_epoch = checkpoint_epoch
+        self.env_config = env_config
+        self.train_config = train_config
 
     def get_action(self, obs_dict, is_determenistic=False):
+        if self.eval_policy == 'teacher':
+            if self._last_expert is None or 'teacher_obs' not in self._last_expert:
+                raise RuntimeError('Teacher evaluation requires privileged observations')
+            task = self.env.task
+            task.model.eval()
+            with torch.no_grad():
+                result = task.model({'is_train': False, 'prev_actions': None,
+                                     'obs': self._last_expert['teacher_obs'].to(task.device),
+                                     'rnn_states': None})
+            action = result['mus'] if is_determenistic else result['actions']
+            return torch.clamp(action, -1.0, 1.0).to(self.device)
         if self.eval_policy == 'prior':
             return super().get_action(obs_dict, is_determenistic)
         # Privileged diagnostic: use the same prior + encoder latent as the training path.
@@ -122,17 +138,19 @@ class TrackingSuccessPlayer(UltraPlayerContinuousDistill):
 
         for env_id in range(num_envs):
             assign(env_id)
-        checkpoint_epoch = None
+        checkpoint_epoch = self.checkpoint_epoch
         curriculum_step = None
         mask_schedule = None
         if self.training_conditions:
             if task._state_init != Ultra.StateInit.Hybrid:
                 raise ValueError('Training-conditions evaluation requires stateInit: Hybrid')
-            checkpoint_data = torch.load(self.checkpoint, map_location='cpu', weights_only=False)
-            if 'epoch' not in checkpoint_data:
-                raise ValueError('Checkpoint has no epoch; cannot reconstruct training mask curriculum')
-            checkpoint_epoch = int(checkpoint_data['epoch'])
-            del checkpoint_data
+            checkpoint_epoch = self.checkpoint_epoch
+            if checkpoint_epoch is None:
+                checkpoint_data = torch.load(self.checkpoint, map_location='cpu', weights_only=False)
+                if 'epoch' not in checkpoint_data:
+                    raise ValueError('Checkpoint has no epoch; cannot reconstruct training mask curriculum')
+                checkpoint_epoch = int(checkpoint_data['epoch'])
+                del checkpoint_data
             mask_schedule = task.update_obs_keep_probabilities(checkpoint_epoch)
             # The checkpoint does not save this task counter. Estimate per-rank environment steps from the epoch.
             curriculum_step = checkpoint_epoch * int(self.horizon_length)
@@ -158,10 +176,36 @@ class TrackingSuccessPlayer(UltraPlayerContinuousDistill):
         sums = torch.zeros((num_envs, 5), dtype=torch.float64, device=device)
         history = torch.zeros((3, num_envs, 39, 3), device=device)
         results = []
+
+        def include_initial_frame(env_ids):
+            # Reset refreshes simulation state and references, but not _curr_obs.
+            # Measure frame zero too: otherwise an initial threshold violation
+            # can be missed and the final report contains only N-1 frames.
+            task._compute_hoi_observations(env_ids)
+            current = task._curr_obs[env_ids]
+            reference = task.hoi_data[task.data_id[env_ids], task.progress_buf[env_ids]]
+            body = current[:, 84:201].reshape(-1, 39, 3)
+            ref_body = reference[:, 84:201].reshape(-1, 39, 3)
+            global_error = (body - ref_body).norm(dim=-1).mean(dim=-1)
+            relative_error = ((body - current[:, None, :3]) -
+                              (ref_body - reference[:, None, :3])).norm(dim=-1).mean(dim=-1)
+            object_error = (current[:, 71:74] - reference[:, 71:74]).norm(dim=-1)
+            q = torch.nn.functional.normalize(current[:, 74:78], dim=-1)
+            q_ref = torch.nn.functional.normalize(reference[:, 74:78], dim=-1)
+            rot_error = 2 * torch.acos((q * q_ref).sum(dim=-1).abs().clamp(max=1.0)) * (180 / math.pi)
+            sums[env_ids, :4] = torch.stack((global_error, relative_error, object_error, rot_error), dim=1).double()
+            history[0, env_ids] = body
+            frames[env_ids] = 1
+            fell = task._rigid_body_pos[env_ids, 0, 2] < task._termination_heights
+            ok_h[env_ids] = torch.isfinite(global_error) & (global_error < 0.3) & ~fell
+            ok_o[env_ids] = torch.isfinite(object_error) & (object_error < 0.3)
+
+        include_initial_frame(torch.arange(num_envs, device=device))
         print(f'[table1 evaluation] Evaluating {task.num_motions} clips; '
               f'{num_envs} environments, {num_objects} object types/scales; '
               f'conditions={"training" if self.training_conditions else "full_clip"}; '
-              f'policy={self.eval_policy}.', flush=True)
+              f'policy={self.eval_policy}; model={self.model_type}; '
+              f'randomization={task.cfg.get("_eval_randomization", "config")}.', flush=True)
         if self.training_conditions:
             print(f'[table1 evaluation] Checkpoint epoch {checkpoint_epoch}; estimated training step '
                   f'{curriculum_step}; random start and observation masks, rollout {task.rollout_length}.', flush=True)
@@ -227,6 +271,7 @@ class TrackingSuccessPlayer(UltraPlayerContinuousDistill):
                     state[:, done_ids, :] = 0
             if len(results) < task.num_motions:
                 obs = self.env_reset(done_ids)
+                include_initial_frame(done_ids)
 
         total_frames = sum(r['frames_evaluated'] for r in results)
         total_jitter_frames = sum(r['_jitter_frames'] for r in results)
@@ -246,22 +291,33 @@ class TrackingSuccessPlayer(UltraPlayerContinuousDistill):
         report = {'protocol': {
             'warning': 'Approximation, not official Table I reproduction; exact split and metric definitions unavailable.',
             'checkpoint': self.checkpoint, 'motion_directory': self.motion_dir,
+            'model_type': self.model_type, 'environment_task': type(task).__name__,
+            'env_config': self.env_config, 'train_config': self.train_config,
+            'finetune_goal_offsets': False,
             'seed': self.seed, 'mode': task.task_mode, 'clips_once': True,
+            'parallel_environments': task.num_envs,
             'conditions': 'training' if self.training_conditions else 'full_clip',
             'start_frame': 'training_random' if self.training_conditions else 0,
             'policy': self.eval_policy,
-            'policy_note': ('Privileged student encoder uses teacher observations; no teacher-action mixing.'
-                            if self.eval_policy == 'encoder' else 'Prior-only deployable student; no teacher-action mixing.'),
-            'action_selection': 'mean action; sampled VAE noise',
+            'policy_note': ({'encoder': 'Privileged student encoder uses teacher observations; no teacher-action mixing.',
+                             'prior': 'Prior-only deployable student; no teacher-action mixing.',
+                             'teacher': 'Privileged teacher using unmasked normalized teacher observations.'}[self.eval_policy]),
+            'action_selection': ('teacher mean action' if self.eval_policy == 'teacher'
+                                 else 'mean action; sampled VAE noise'),
             'checkpoint_epoch': checkpoint_epoch, 'estimated_common_step_counter': curriculum_step,
+            'checkpoint_horizon_length': self.horizon_length,
             'mask_curriculum': mask_schedule, 'rollout_length': task.rollout_length,
             'stand_still_ratio': task.stand_still_ratio,
             'success_threshold_m': 0.3, 'body_origins': 39,
+            'initial_frame_included': True,
             'relative_error': 'Subtract each root position; no rotational alignment.',
             'rotation_error': 'Quaternion geodesic angle, degrees.',
             'jitter': 'Mean magnitude of third finite difference of world body positions divided by dt^3.',
             'error_aggregation': 'Frame-weighted over simulated frames, including failed episodes up to termination.',
             'dt_seconds': task.dt, 'domain_randomization': task.cfg['domain_rand']['domain_rand_general'],
+            'randomization_mode': task.cfg.get('_eval_randomization', 'config'),
+            'domain_randomization_config': task.cfg['domain_rand'],
+            'observation_noise': task.cfg['noise']['add_noise'],
             'padded_final_frames_excluded': 0 if self.training_conditions else 20,
         }, 'summary': summary, 'motions': results}
         print('[table1 evaluation] APPROXIMATE RESULTS: ' + json.dumps(summary, indent=2), flush=True)

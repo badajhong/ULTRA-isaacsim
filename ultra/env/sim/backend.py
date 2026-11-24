@@ -479,6 +479,12 @@ class IsaacSimBackend:
         idx = env_ids.to(torch.int32)
         self.robot_view.set_dof_positions(self._dof_pos, idx)
         self.robot_view.set_dof_velocities(self._dof_vel, idx)
+        # PhysX updates the root transform and DOF tensors immediately, but
+        # cached child-link transforms still describe the previous pose until
+        # forward kinematics is explicitly refreshed (or physics advances).
+        # Reset observations and tracking metrics read those links before the
+        # first physics step, so update them without advancing simulation time.
+        self.sim.physics_sim_view.update_articulations_kinematic()
 
     def set_dof_actuation_force_tensor(self, forces):
         forces = forces.view(self.num_envs, self.num_dofs)

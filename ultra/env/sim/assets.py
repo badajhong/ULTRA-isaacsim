@@ -2,7 +2,7 @@
 
 * The robot URDF is converted with Isaac Lab's ``UrdfConverter`` (fixed links kept, convex decomposition
   colliders), then patched so that it matches the Isaac Gym asset ULTRA was trained with: V-HACD parameters,
-  Gym's per-shape collision filter bits, and massless sensor frames.
+  Gym's per-shape collision filter bits, fixed-assembly adjacency exclusions, and massless sensor frames.
 * Object meshes (``.obj``) are written directly as single rigid-body USDs with density-based mass and convex
   decomposition colliders, which is what Isaac Gym built from the object URDFs.
 
@@ -62,6 +62,9 @@ def prepare_robot_usd(spec, urdf_info, cache_dir=DEFAULT_CACHE_DIR, contact_offs
         "hull_vertex_limit": spec.hull_vertex_limit,
         "voxel_resolution": spec.voxel_resolution,
         "collision_filter": spec.collision_filter,
+        # Include the expanded fixed-link exclusions in the key so existing converted
+        # robots are regenerated; old USDs otherwise retain spurious self contacts.
+        "adjacent_collision_pairs": urdf_info.adjacent_collision_pairs,
         "contact_offset": contact_offset,
         "rest_offset": rest_offset,
     }
@@ -128,7 +131,7 @@ def _patch_robot_usd(usd_path, spec, urdf_info, contact_offset, rest_offset):
         if changed:
             stage.GetRootLayer().Save()
 
-    # 2. Links (not instanced): massless frames and Isaac Gym's collision filter bits, authored in the root layer.
+    # 2. Links (not instanced): massless frames, filter bits, and fixed-assembly adjacency in the root layer.
     stage = Usd.Stage.Open(usd_path)
     stage.SetEditTarget(stage.GetRootLayer())
     links = {prim.GetName(): prim for prim in stage.Traverse() if prim.HasAPI(UsdPhysics.RigidBodyAPI)}
@@ -144,7 +147,9 @@ def _patch_robot_usd(usd_path, spec, urdf_info, contact_offset, rest_offset):
         mass_api.CreateDiagonalInertiaAttr().Set((MASSLESS_LINK_INERTIA,) * 3)
 
     pairs = 0
-    for a, b in filtered_link_pairs(spec.collision_filter):
+    collision_pairs = set(filtered_link_pairs(spec.collision_filter))
+    collision_pairs.update(urdf_info.adjacent_collision_pairs)
+    for a, b in sorted(collision_pairs):
         if a in links and b in links:
             UsdPhysics.FilteredPairsAPI.Apply(links[a]).CreateFilteredPairsRel().AddTarget(links[b].GetPath())
             pairs += 1

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Usage: eval_training_conditions.sh CHECKPOINT MOTION_DIRECTORY [NUM_ENVS] [OUTPUT_JSON] [prior|encoder] [extra args...]
+# Distilled and V3 finetune checkpoints are auto-detected; both use the common tracking task.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 checkpoint="${1:?Usage: scripts/eval_training_conditions.sh CHECKPOINT MOTION_DIRECTORY [NUM_ENVS] [OUTPUT_JSON] [prior|encoder]}"

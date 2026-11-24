@@ -16,6 +16,7 @@ class UrdfInfo:
     dof_effort: list
     dof_velocity: list
     massless_bodies: list = field(default_factory=list)  # links without an <inertial> element
+    adjacent_collision_pairs: list = field(default_factory=list)
 
 
 def parse_urdf(path):
@@ -61,7 +62,41 @@ def parse_urdf(path):
             visit(child)
 
     visit(roots[0])
-    return UrdfInfo(body_names, dof_names, lower, upper, effort, velocity, massless)
+    return UrdfInfo(body_names, dof_names, lower, upper, effort, velocity, massless,
+                    _adjacent_collision_pairs(root))
+
+
+def _adjacent_collision_pairs(root):
+    """Collision exclusions for neighboring rigid assemblies, keeping fixed links in the state tensors.
+
+    Isaac Gym excludes collisions across a joint, including the fixed attachments of either side.
+    Isaac Sim keeps those attachments as separate articulation links when merge_fixed_joints=False;
+    its joint collision flag only excludes the two links directly named by that joint. Expand the
+    exclusion over fixed-connected components without removing any links or their observations.
+    """
+    parent = {link.get("name"): link.get("name") for link in root.findall("link")}
+
+    def find(name):
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    joints = [(joint.get("type"), joint.find("parent").get("link"), joint.find("child").get("link"))
+              for joint in root.findall("joint")]
+    for kind, a, b in joints:
+        if kind == "fixed":
+            parent[find(b)] = find(a)
+    groups = {}
+    for name in parent:
+        groups.setdefault(find(name), []).append(name)
+    pairs = set()
+    for _, a, b in joints:
+        for left in groups[find(a)]:
+            for right in groups[find(b)]:
+                if left != right:
+                    pairs.add(tuple(sorted((left, right))))
+    return sorted(pairs)
 
 
 def urdf_collision_meshes(path):

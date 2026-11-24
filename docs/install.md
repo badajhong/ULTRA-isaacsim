@@ -74,6 +74,8 @@ python -c "from isaacsim import SimulationApp; app = SimulationApp({'headless': 
 * **Asset cache.** The first run converts `g1_29dof.urdf` and the object meshes to USD under
   `ultra/data/assets/usd/` (git-ignored). Delete that folder to force a reconversion. The first start also fills
   the shader and convex-decomposition caches, so it is slower than later starts.
+  The cache key includes collision exclusions for fixed attachments of neighboring links. Older converted
+  robots are automatically replaced after this correction; manually deleting the cache is unnecessary.
 * **Viewer.** Without `--headless` the Isaac Sim window replaces the Isaac Gym viewer. Close the window to quit; the
   Isaac Gym keyboard shortcuts (`V`, `Esc`) are not available. Debug drawing uses `isaacsim.util.debug_draw`, and
   `--save_images` captures the viewport. Add `--enable_cameras` to capture images in headless mode.
@@ -86,11 +88,15 @@ python -c "from isaacsim import SimulationApp; app = SimulationApp({'headless': 
   `max_gpu_contact_pairs` (contact buffer). `default_buffer_size_multiplier` is ignored; Isaac Sim buffer sizes
   can be set directly with `gpu_*` keys (for example `gpu_max_rigid_patch_count: 2097152`) if PhysX reports a
   buffer overflow.
-* **Differences from Isaac Gym.** Isaac Sim runs PhysX 5 (Isaac Gym used PhysX 4) and its own V-HACD convex
+* **Differences from Isaac Gym.** Isaac Sim uses a newer PhysX version and its own V-HACD convex
   decomposition, so object masses differ by about 1 % and the G1 has more collision hulls. Rolling and torsion
   friction of the objects have no PhysX 5 material equivalent and are not applied. The four sensor frames without
   inertia in the URDF get 1 g. Policies trained in Isaac Gym, including the included teacher, run unchanged but
   can behave slightly differently. Check them in Isaac Sim before you depend on them.
+  Fixed links are retained to preserve the 39-body observation layout. Collision exclusions are expanded over
+  fixed-connected assemblies and their joint neighbors, matching the original robot's adjacent-link filtering.
+  Without this expansion, the pelvis cover can collide with the hip pitch links and prevent the official
+  teacher from tracking. This correction preserves self collisions between non-neighboring assemblies.
 * **Isaac Gym version.** The last commit that runs on Isaac Gym Preview 4 (Python 3.8) is `146ddd5`.
 
 ## 4. MuJoCo (sim2sim only)

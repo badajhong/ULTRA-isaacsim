@@ -213,6 +213,12 @@ def build_alg_runner(algo_observer):
         from learning import ultra_agent_distill_vae_rl, ultra_network_builder_obj_v3
         agent = ultra_agent_distill_vae_rl.UltraAgentDistill
         builder = ultra_network_builder_obj_v3.UltraBuilder
+    elif args.eval_episodes and args.eval_model == 'finetune':
+        # Load the complete fine-tuned policy, while keeping the common V2 tracking
+        # environment rather than the goal-offset RL training environment.
+        from learning import ultra_network_builder_obj_v3
+        agent = ultra_agent_distill_vae.UltraAgentDistill
+        builder = ultra_network_builder_obj_v3.UltraBuilder
     else:
         agent = ultra_agent_distill_vae.UltraAgentDistill
         builder = ultra_network_builder_obj_v2.UltraBuilder
@@ -223,6 +229,8 @@ def build_alg_runner(algo_observer):
             episodes=args.eval_episodes, full_clips=args.eval_full_clips, output=args.eval_output,
             checkpoint=args.checkpoint, motion_dir=args.motion_file, seed=args.seed,
             training_conditions=args.eval_training_conditions, eval_policy=args.eval_policy,
+            model_type=args.eval_model, checkpoint_epoch=args.eval_checkpoint_epoch,
+            env_config=args.cfg_env, train_config=args.cfg_train,
             horizon_length=cfg_train['params']['config']['horizon_length'], **kwargs))
     else:
         runner.player_factory.register_builder('ultra', lambda **kwargs : ultra_players_distill.UltraPlayerContinuousDistill(**kwargs))
@@ -237,14 +245,19 @@ def main():
     global cfg_train
 
     set_np_formatting()
+    from learning.tracking_checkpoint import prepare_tracking_evaluation
+    prepare_tracking_evaluation(args)
     cfg, cfg_train, logdir = load_cfg(args)
 
-    if args.eval_episodes and (args.eval_episodes < 0 or not args.test or args.task != 'UltraDistillObjV2Point'):
-        raise ValueError('--eval_episodes requires a positive count, --test and task UltraDistillObjV2Point')
-    if args.eval_full_clips and not args.eval_episodes:
-        raise ValueError('--eval_full_clips requires --eval_episodes and --test')
-    if args.eval_training_conditions and (not args.eval_full_clips or args.task_mode):
-        raise ValueError('--eval_training_conditions requires --eval_full_clips and no fixed --task_mode')
+    if args.eval_episodes:
+        from learning.tracking_protocol import configure_tracking_randomization
+        configure_tracking_randomization(cfg, args.eval_randomization)
+        cfg['_eval_randomization'] = args.eval_randomization
+        print(f'[tracking evaluation] Randomization={args.eval_randomization}.', flush=True)
+
+    if args.eval_episodes and args.eval_policy == 'teacher':
+        # The task constructs and strictly loads its own privileged teacher.
+        cfg['env']['teacherPolicy'] = args.checkpoint
 
     if args.resume_from:
         cfg_train['params']['config']['resume_from'] = args.resume_from
@@ -314,7 +327,11 @@ def main():
         )
     else:
         os.environ["WANDB_DISABLED"] = "true"
-    vargs = vars(args)
+    vargs = dict(vars(args))
+    if args.eval_episodes and args.eval_policy == 'teacher':
+        # The player still constructs a student network, but never uses it.
+        # Avoid trying to load the teacher weights into that student network.
+        vargs['checkpoint'] = 'Base'
 
     algo_observer = RLGPUAlgoObserver()
 

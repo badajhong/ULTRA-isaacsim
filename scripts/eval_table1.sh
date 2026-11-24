@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Usage: eval_table1.sh CHECKPOINT MOTION_DIRECTORY [NUM_ENVS] [OUTPUT_JSON] [extra arguments...]
+# Distilled and V3 finetune checkpoints are auto-detected; append --eval_policy teacher for a teacher checkpoint.
+# Defaults to nominal physics/sensing; append --eval_randomization config for the previous training randomization.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 checkpoint="${1:?Usage: scripts/eval_table1.sh CHECKPOINT MOTION_DIRECTORY [NUM_ENVS] [OUTPUT_JSON]}"
@@ -12,9 +14,9 @@ if ! [[ "$num_envs" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
-python ultra/run_distill.py --task UltraDistillObjV2Point \
+exec python ultra/run_distill.py --task UltraDistillObjV2Point \
     --cfg_env ultra/data/cfg/g1_student_vae.yaml \
     --cfg_train ultra/data/cfg/train/rlg/g1_student_vae.yaml \
     --test --headless --task_mode full_track --seed 42 --num_envs "$num_envs" \
     --checkpoint "$checkpoint" --motion_file "$motion_dir" --eval_episodes 1 \
-    --eval_full_clips --eval_output "$output" "$@"
+    --eval_full_clips --eval_randomization nominal --eval_output "$output" "$@"
