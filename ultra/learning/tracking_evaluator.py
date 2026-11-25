@@ -205,7 +205,7 @@ class TrackingSuccessPlayer(UltraPlayerContinuousDistill):
               f'{num_envs} environments, {num_objects} object types/scales; '
               f'conditions={"training" if self.training_conditions else "full_clip"}; '
               f'policy={self.eval_policy}; model={self.model_type}; '
-              f'randomization={task.cfg.get("_eval_randomization", "config")}.', flush=True)
+              f'randomization={task.cfg.get("_eval_randomization", "config") }.' , flush=True)
         if self.training_conditions:
             print(f'[table1 evaluation] Checkpoint epoch {checkpoint_epoch}; estimated training step '
                   f'{curriculum_step}; random start and observation masks, rollout {task.rollout_length}.', flush=True)
@@ -316,6 +316,8 @@ class TrackingSuccessPlayer(UltraPlayerContinuousDistill):
             'error_aggregation': 'Frame-weighted over simulated frames, including failed episodes up to termination.',
             'dt_seconds': task.dt, 'domain_randomization': task.cfg['domain_rand']['domain_rand_general'],
             'randomization_mode': task.cfg.get('_eval_randomization', 'config'),
+            'physics_asset_reference': {'source': 'Isaac Sim URDF conversion and convex decomposition'},
+            'evaluation_split': 'unspecified (supplied motion directory; no ID/OOD split generated)',
             'domain_randomization_config': task.cfg['domain_rand'],
             'observation_noise': task.cfg['noise']['add_noise'],
             'padded_final_frames_excluded': 0 if self.training_conditions else 20,

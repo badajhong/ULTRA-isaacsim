@@ -23,8 +23,8 @@ def prepare_tracking_evaluation(args):
     if args.eval_training_conditions and (not args.eval_full_clips or args.task_mode):
         raise ValueError("--eval_training_conditions requires --eval_full_clips and no fixed --task_mode")
     if not args.eval_episodes:
-        if getattr(args, 'eval_randomization', 'config') != 'config':
-            raise ValueError('--eval_randomization requires --eval_episodes')
+        if getattr(args, "eval_randomization", "config") != "config":
+            raise ValueError("--eval_randomization requires --eval_episodes")
         if args.eval_model != "auto":
             raise ValueError("--eval_model requires --eval_episodes")
         return

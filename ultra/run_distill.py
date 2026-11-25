@@ -248,12 +248,10 @@ def main():
     from learning.tracking_checkpoint import prepare_tracking_evaluation
     prepare_tracking_evaluation(args)
     cfg, cfg_train, logdir = load_cfg(args)
-
     if args.eval_episodes:
         from learning.tracking_protocol import configure_tracking_randomization
         configure_tracking_randomization(cfg, args.eval_randomization)
-        cfg['_eval_randomization'] = args.eval_randomization
-        print(f'[tracking evaluation] Randomization={args.eval_randomization}.', flush=True)
+        cfg["_eval_randomization"] = args.eval_randomization
 
     if args.eval_episodes and args.eval_policy == 'teacher':
         # The task constructs and strictly loads its own privileged teacher.

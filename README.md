@@ -206,17 +206,15 @@ scripts/eval_table1.sh ultra/weights/teacher_ultra_inference.pth InterAct/OMOMO_
 The teacher receives its unmasked normalized privileged observation and uses its mean action. Its weights are loaded
 by the environment; the student network constructed by the evaluation runner does not select actions.
 
-Use a separate directory and output path for each ID or OOD set; this script does not infer a split. The environment
+The script evaluates the supplied motion directory without creating or inferring an ID/OOD split. The environment
 count must be at least the number of distinct object type/scale combinations in the motion directory. Loading a large
 motion set can require substantial GPU memory. A JSON report contains settings and one result per clip; the terminal
-prints a summary. Runs use full tracking, seed 42, and nominal physics/sensing (`--eval_randomization nominal`):
-training pushes, physical randomization, reset perturbations, and observation noise are disabled. Object mass,
-COM, and inertia randomization are also disabled explicitly because those task settings bypass the general
-randomization flag. Student actions use the mean decoder output with a sampled prior latent.
-Use `--seed <number>` after the output path to repeat with another seed. Append `--eval_randomization config`
-to retain the YAML's randomization, as older versions of this script did. `eval_training_conditions.sh` continues
-to use the training configuration. These are different evaluation conditions and should be reported separately;
-nominal mode is a declared tracking benchmark, not a claim that the paper's unreleased protocol is identical.
+prints a summary. Runs use full tracking, seed 42, and the environment YAML's physics, randomization and
+sensing settings unchanged. Student actions use the mean decoder output with a sampled prior latent.
+Use `--seed <number>` after the output path to repeat with another seed. Append `--eval_randomization none` to disable physical randomization, reset perturbations, action delay,
+observation noise and point-cloud/camera augmentation for this evaluation only. The default is `config`. ID/OOD describes the motion/object-scale split; toggling randomization does not create
+an ID or OOD split. Evaluating the complete training directory is a full-corpus tracking check. No synthetic
+OOD set is generated or claimed to match the paper's unavailable evaluation split.
 
 The reported quantities are an **approximation**, not official Table I results. The two success rates use 0.3 m
 thresholds at every frame, including the initial reference frame. Body errors use 39 body origins; the local
